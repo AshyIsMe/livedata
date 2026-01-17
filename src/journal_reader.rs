@@ -20,7 +20,7 @@ impl JournalLogReader {
             .open()
             .map_err(|e| anyhow!("Failed to open journal: {}", e))?;
 
-        let mut reader = Self { journal };
+        let reader = Self { journal };
         //reader.seek_to_tail()?;
 
         info!("Journal reader initialized successfully");
@@ -33,6 +33,61 @@ impl JournalLogReader {
             .seek_tail()
             .map_err(|e| anyhow!("Failed to seek to tail: {}", e))?;
         Ok(())
+    }
+
+    pub fn seek_to_timestamp(&mut self, timestamp: DateTime<Utc>) -> Result<()> {
+        info!("Seeking to timestamp: {}", timestamp);
+
+        // Convert timestamp to microseconds since epoch for systemd
+        let timestamp_usec = timestamp.timestamp_micros().to_string();
+
+        // Add match for timestamp
+        self.journal
+            .match_add("__REALTIME_TIMESTAMP", timestamp_usec)?;
+
+        Ok(())
+    }
+
+    pub fn skip_older_than(&mut self, cutoff_timestamp: DateTime<Utc>) -> Result<usize> {
+        info!("Skipping entries older than: {}", cutoff_timestamp);
+
+        let mut skipped_count = 0;
+
+        // Seek to the beginning of the journal first
+        self.journal
+            .seek_head()
+            .map_err(|e| anyhow!("Failed to seek to head: {}", e))?;
+
+        // Read and discard entries older than cutoff
+        loop {
+            match self.journal.next_entry() {
+                Ok(Some(entry)) => {
+                    if let Ok(log_entry) = self.convert_journal_entry(&entry) {
+                        if log_entry.timestamp >= cutoff_timestamp {
+                            // This entry is within our time window
+                            info!(
+                                "Found first entry within time window: {}",
+                                log_entry.timestamp
+                            );
+                            break;
+                        } else {
+                            skipped_count += 1;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Reached end of journal
+                    break;
+                }
+                Err(_) => {
+                    // Error reading entry, stop skipping
+                    break;
+                }
+            }
+        }
+
+        info!("Skipped {} entries older than cutoff", skipped_count);
+        Ok(skipped_count)
     }
 
     pub fn wait_for_entry(&mut self) -> Result<bool> {
@@ -119,6 +174,64 @@ impl JournalLogReader {
             Ok(None) => Ok(None),
             Err(_) => Ok(None),
         }
+    }
+
+    pub fn process_historical_entries<F>(
+        &mut self,
+        cutoff_timestamp: DateTime<Utc>,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&LogEntry) -> Result<()>,
+    {
+        info!("Processing historical entries from: {}", cutoff_timestamp);
+
+        let mut processed_count = 0;
+
+        // First, seek to tail to get to recent entries faster
+        self.journal
+            .seek_tail()
+            .map_err(|e| anyhow!("Failed to seek to tail: {}", e))?;
+
+        // Estimate how far back to go (rough approximation)
+        // Journal entries are typically in reverse chronological order when seeking from tail
+        // We'll go back a reasonable amount and then filter
+        let entries_to_check = 10000; // Reasonable limit for last hour
+        let mut entries_checked = 0;
+
+        // Process entries, looking for ones within our time window
+        while entries_checked < entries_to_check {
+            match self.journal.previous_entry() {
+                Ok(Some(entry)) => {
+                    if let Ok(log_entry) = self.convert_journal_entry(&entry) {
+                        if log_entry.timestamp >= cutoff_timestamp
+                            && log_entry.timestamp <= Utc::now()
+                        {
+                            callback(&log_entry)?;
+                            processed_count += 1;
+                        } else if log_entry.timestamp < cutoff_timestamp {
+                            // We've gone far enough back
+                            break;
+                        }
+                    }
+                    entries_checked += 1;
+                }
+                Ok(None) => {
+                    // Reached beginning of journal
+                    break;
+                }
+                Err(_) => {
+                    // Error reading entry, stop processing
+                    break;
+                }
+            }
+        }
+
+        info!(
+            "Processed {} historical entries from {} checked",
+            processed_count, entries_checked
+        );
+        Ok(processed_count)
     }
 }
 

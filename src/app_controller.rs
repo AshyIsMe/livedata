@@ -62,6 +62,9 @@ impl ApplicationController {
 
         self.setup_signal_handler()?;
 
+        // Process historical data from the last hour on startup
+        self.process_startup_historical_data()?;
+
         let mut last_flush_time = Utc::now();
         let flush_interval = TimeDelta::seconds(30); // Check for completed minutes every 30 seconds
 
@@ -109,6 +112,57 @@ impl ApplicationController {
 
         // Graceful shutdown - flush all remaining data
         self.graceful_shutdown()
+    }
+
+    fn process_startup_historical_data(&mut self) -> Result<()> {
+        info!("Processing startup historical data - last hour of logs");
+
+        // Calculate cutoff time (1 hour ago)
+        let cutoff_time = Utc::now() - TimeDelta::hours(1);
+
+        // Process historical entries from the last hour
+        let processed_count =
+            self.journal_reader
+                .process_historical_entries(cutoff_time, |entry| {
+                    // Add entry to buffer
+                    self.buffer.add_entry(entry)
+                })?;
+
+        info!(
+            "Processed {} historical entries from the last hour",
+            processed_count
+        );
+
+        // Immediately flush all the historical data to parquet
+        if processed_count > 0 {
+            info!("Flushing historical data to parquet files");
+            let current_time = Utc::now();
+
+            // Flush all completed minutes from historical data
+            let results = self
+                .parquet_writer
+                .write_completed_minutes(&mut self.buffer, current_time)?;
+
+            if !results.is_empty() {
+                let total_entries: i64 = results.iter().map(|r| r.entries_written).sum();
+                let total_bytes: u64 = results.iter().map(|r| r.bytes_written).sum();
+
+                info!(
+                    "Historical data flushed: {} minutes, {} entries ({} bytes)",
+                    results.len(),
+                    total_entries,
+                    total_bytes
+                );
+            }
+        } else {
+            info!("No historical entries found in the last hour");
+        }
+
+        // Now seek to tail for real-time monitoring
+        self.journal_reader.seek_to_tail()?;
+        info!("Completed historical data processing, starting real-time monitoring");
+
+        Ok(())
     }
 
     fn process_log_entry(&mut self, entry: LogEntry) -> Result<()> {
