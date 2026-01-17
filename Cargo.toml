@@ -4,3 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+systemd = "0.10"           # journald interface
+duckdb = { version = "1.4.3", features = ["bundled", "serde_json", "r2d2", "parquet"] }  # in-memory database for buffering
+chrono = { version = "0.4", features = ["serde"] }
+gethostname = "0.4"        # system hostname
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"         # JSON serialization
+tokio = { version = "1.49", features = ["full"] }
+anyhow = "1.0"             # error handling
+log = "0.4"                # logging
+env_logger = "0.10"        # logger implementation
+signal-hook = "0.3"        # signal handling
+tempfile = "3.24"            # temporary directories for tests
+arrow = "57.2.0"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+]
