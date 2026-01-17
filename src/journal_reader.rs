@@ -169,6 +169,13 @@ impl JournalLogReader {
         match self.journal.next_entry() {
             Ok(Some(entry)) => {
                 let log_entry = self.convert_journal_entry(&entry)?;
+
+                // Print all fields of each journal message for real-time processing
+                info!("Real-time Journal Entry {}:", log_entry.timestamp);
+                for (key, value) in &log_entry.fields {
+                    info!("  {}: {}", key, value);
+                }
+
                 Ok(Some(log_entry))
             }
             Ok(None) => Ok(None),
@@ -204,6 +211,12 @@ impl JournalLogReader {
             match self.journal.previous_entry() {
                 Ok(Some(entry)) => {
                     if let Ok(log_entry) = self.convert_journal_entry(&entry) {
+                        // Print all fields of each journal message
+                        info!("Journal Entry {}:", log_entry.timestamp);
+                        for (key, value) in &log_entry.fields {
+                            info!("  {}: {}", key, value);
+                        }
+
                         if log_entry.timestamp >= cutoff_timestamp
                             && log_entry.timestamp <= Utc::now()
                         {
