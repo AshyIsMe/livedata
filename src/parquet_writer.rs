@@ -101,11 +101,13 @@ impl ParquetWriter {
         // Use buffer's connection for export
         let export_conn = &buffer.conn;
 
-        // Use DuckDB's COPY command to export to parquet
+        // Use DuckDB's COPY command to export to parquet with new schema
         let copy_sql = format!(
-            "COPY (SELECT timestamp, fields FROM journal_logs WHERE minute_key = '{}' ORDER BY timestamp) 
+            "COPY (SELECT timestamp, minute_key, message, priority, systemd_unit, hostname, 
+                    pid, exe, syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields 
+             FROM journal_logs WHERE minute_key = '{}' ORDER BY timestamp) 
              TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
-            minute_key.to_rfc3339(),
+            minute_key,
             filepath.display()
         );
 

@@ -15,12 +15,23 @@ impl DuckDBBuffer {
         info!("Initializing DuckDB in-memory buffer");
         let conn = Connection::open_in_memory()?;
 
-        // Create the main table for journal logs
+        // Create the main table for journal logs with proper data types
         conn.execute(
             "CREATE TABLE journal_logs (
-                timestamp TEXT NOT NULL,
-                minute_key TEXT NOT NULL,
-                fields JSON NOT NULL
+                timestamp TIMESTAMP NOT NULL,
+                minute_key TIMESTAMP NOT NULL,
+                message TEXT,
+                priority INTEGER,
+                systemd_unit TEXT,
+                hostname TEXT,
+                pid INTEGER,
+                exe TEXT,
+                syslog_identifier TEXT,
+                syslog_facility TEXT,
+                _uid INTEGER,
+                _gid INTEGER,
+                _comm TEXT,
+                extra_fields JSON
             )",
             [],
         )?;
@@ -31,6 +42,12 @@ impl DuckDBBuffer {
             [],
         )?;
         conn.execute("CREATE INDEX idx_timestamp ON journal_logs(timestamp)", [])?;
+        conn.execute("CREATE INDEX idx_priority ON journal_logs(priority)", [])?;
+        conn.execute("CREATE INDEX idx_hostname ON journal_logs(hostname)", [])?;
+        conn.execute(
+            "CREATE INDEX idx_systemd_unit ON journal_logs(systemd_unit)",
+            [],
+        )?;
 
         info!("DuckDB buffer initialized successfully");
 
@@ -39,14 +56,68 @@ impl DuckDBBuffer {
 
     pub fn add_entry(&mut self, entry: &LogEntry) -> Result<()> {
         let minute_key = entry.minute_key();
-        let fields_json = serde_json::to_string(&entry.fields)?;
+
+        // Extract common fields with proper type conversions
+        let message = entry.get_message().cloned();
+        let priority = entry.get_priority().and_then(|p| p.parse::<i32>().ok());
+        let systemd_unit = entry.get_systemd_unit().cloned();
+        let hostname = entry.get_hostname().cloned();
+        let pid = entry.get_pid().and_then(|p| p.parse::<i32>().ok());
+        let exe = entry.get_exe().cloned();
+        let syslog_identifier = entry.get_field("SYSLOG_IDENTIFIER").cloned();
+        let syslog_facility = entry.get_field("SYSLOG_FACILITY").cloned();
+        let _uid = entry.get_field("_UID").and_then(|u| u.parse::<i32>().ok());
+        let _gid = entry.get_field("_GID").and_then(|g| g.parse::<i32>().ok());
+        let _comm = entry.get_field("_COMM").cloned();
+
+        // Create extra_fields JSON with uncommon fields
+        let common_fields = std::collections::HashSet::from([
+            "MESSAGE".to_string(),
+            "PRIORITY".to_string(),
+            "_SYSTEMD_UNIT".to_string(),
+            "_HOSTNAME".to_string(),
+            "_PID".to_string(),
+            "_EXE".to_string(),
+            "SYSLOG_IDENTIFIER".to_string(),
+            "SYSLOG_FACILITY".to_string(),
+            "_UID".to_string(),
+            "_GID".to_string(),
+            "_COMM".to_string(),
+        ]);
+
+        let extra_fields: std::collections::HashMap<String, String> = entry
+            .fields
+            .iter()
+            .filter(|(k, _)| !common_fields.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let extra_fields_json = if extra_fields.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extra_fields)?)
+        };
 
         self.conn.execute(
-            "INSERT INTO journal_logs (timestamp, minute_key, fields) VALUES (?, ?, ?)",
+            "INSERT INTO journal_logs (
+                timestamp, minute_key, message, priority, systemd_unit, hostname, 
+                pid, exe, syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 entry.timestamp.to_rfc3339(),
                 minute_key.to_rfc3339(),
-                fields_json
+                message,
+                priority,
+                systemd_unit,
+                hostname,
+                pid,
+                exe,
+                syslog_identifier,
+                syslog_facility,
+                _uid,
+                _gid,
+                _comm,
+                extra_fields_json
             ],
         )?;
 
@@ -59,17 +130,89 @@ impl DuckDBBuffer {
     ) -> Result<Vec<(DateTime<Utc>, Value)>> {
         let mut entries = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, fields FROM journal_logs WHERE minute_key = ? ORDER BY timestamp",
+            "SELECT timestamp, message, priority, systemd_unit, hostname, pid, exe, 
+                    syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields 
+             FROM journal_logs WHERE minute_key = ? ORDER BY timestamp",
         )?;
         let mut rows = stmt.query(params![minute_key.to_rfc3339()])?;
 
         while let Some(row) = rows.next()? {
             let timestamp_str: String = row.get(0)?;
-            let fields_json: String = row.get(1)?;
-            let fields: Value = serde_json::from_str(&fields_json)?;
+            let timestamp: DateTime<Utc> = timestamp_str.parse()?;
 
-            let timestamp_utc: DateTime<Utc> = timestamp_str.parse()?;
-            entries.push((timestamp_utc, fields));
+            // Reconstruct the original fields structure
+            let mut fields = serde_json::Map::new();
+
+            // Add common fields if they exist
+            if let Some(message) = row.get::<_, Option<String>>(1)? {
+                fields.insert("MESSAGE".to_string(), serde_json::Value::String(message));
+            }
+            if let Some(priority) = row.get::<_, Option<i32>>(2)? {
+                fields.insert(
+                    "PRIORITY".to_string(),
+                    serde_json::Value::String(priority.to_string()),
+                );
+            }
+            if let Some(systemd_unit) = row.get::<_, Option<String>>(3)? {
+                fields.insert(
+                    "_SYSTEMD_UNIT".to_string(),
+                    serde_json::Value::String(systemd_unit),
+                );
+            }
+            if let Some(hostname) = row.get::<_, Option<String>>(4)? {
+                fields.insert("_HOSTNAME".to_string(), serde_json::Value::String(hostname));
+            }
+            if let Some(pid) = row.get::<_, Option<i32>>(5)? {
+                fields.insert(
+                    "_PID".to_string(),
+                    serde_json::Value::String(pid.to_string()),
+                );
+            }
+            if let Some(exe) = row.get::<_, Option<String>>(6)? {
+                fields.insert("_EXE".to_string(), serde_json::Value::String(exe));
+            }
+            if let Some(syslog_identifier) = row.get::<_, Option<String>>(7)? {
+                fields.insert(
+                    "SYSLOG_IDENTIFIER".to_string(),
+                    serde_json::Value::String(syslog_identifier),
+                );
+            }
+            if let Some(syslog_facility) = row.get::<_, Option<String>>(8)? {
+                fields.insert(
+                    "SYSLOG_FACILITY".to_string(),
+                    serde_json::Value::String(syslog_facility),
+                );
+            }
+            if let Some(_uid) = row.get::<_, Option<i32>>(9)? {
+                fields.insert(
+                    "_UID".to_string(),
+                    serde_json::Value::String(_uid.to_string()),
+                );
+            }
+            if let Some(_gid) = row.get::<_, Option<i32>>(10)? {
+                fields.insert(
+                    "_GID".to_string(),
+                    serde_json::Value::String(_gid.to_string()),
+                );
+            }
+            if let Some(_comm) = row.get::<_, Option<String>>(11)? {
+                fields.insert("_COMM".to_string(), serde_json::Value::String(_comm));
+            }
+
+            // Add extra fields if they exist
+            if let Some(extra_fields_json) = row.get::<_, Option<String>>(12)? {
+                if let Ok(extra_fields) =
+                    serde_json::from_str::<serde_json::Value>(&extra_fields_json)
+                {
+                    if let serde_json::Value::Object(extra_map) = extra_fields {
+                        for (key, value) in extra_map {
+                            fields.insert(key, value);
+                        }
+                    }
+                }
+            }
+
+            entries.push((timestamp, serde_json::Value::Object(fields)));
         }
 
         Ok(entries)
@@ -92,8 +235,8 @@ impl DuckDBBuffer {
 
         while let Some(row) = rows.next()? {
             let minute_key_str: String = row.get(0)?;
-            let minute_key_utc: DateTime<Utc> = minute_key_str.parse()?;
-            minutes.insert(minute_key_utc);
+            let minute_key: DateTime<Utc> = minute_key_str.parse()?;
+            minutes.insert(minute_key);
         }
 
         Ok(minutes)
@@ -215,6 +358,11 @@ mod tests {
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
+        fields.insert("PRIORITY".to_string(), "6".to_string());
+        fields.insert("_SYSTEMD_UNIT".to_string(), "test.service".to_string());
+        fields.insert("_HOSTNAME".to_string(), "test-host".to_string());
+        fields.insert("_PID".to_string(), "1234".to_string());
+        fields.insert("CUSTOM_FIELD".to_string(), "custom value".to_string());
 
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 45).unwrap();
         let entry = LogEntry::new(timestamp, fields);
@@ -226,6 +374,27 @@ mod tests {
         let retrieved = buffer.get_entries_for_minute(minute_key).unwrap();
         assert_eq!(retrieved.len(), 1);
         assert_eq!(retrieved[0].0, timestamp);
+
+        // Verify field extraction worked correctly
+        let fields = retrieved[0].1.as_object().unwrap();
+        assert_eq!(
+            fields.get("MESSAGE").unwrap().as_str().unwrap(),
+            "Test message"
+        );
+        assert_eq!(fields.get("PRIORITY").unwrap().as_str().unwrap(), "6");
+        assert_eq!(
+            fields.get("_SYSTEMD_UNIT").unwrap().as_str().unwrap(),
+            "test.service"
+        );
+        assert_eq!(
+            fields.get("_HOSTNAME").unwrap().as_str().unwrap(),
+            "test-host"
+        );
+        assert_eq!(fields.get("_PID").unwrap().as_str().unwrap(), "1234");
+        assert_eq!(
+            fields.get("CUSTOM_FIELD").unwrap().as_str().unwrap(),
+            "custom value"
+        );
     }
 
     #[test]
@@ -234,6 +403,7 @@ mod tests {
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
+        fields.insert("PRIORITY".to_string(), "6".to_string());
 
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 45).unwrap();
         let entry = LogEntry::new(timestamp, fields);
@@ -251,6 +421,7 @@ mod tests {
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
+        fields.insert("PRIORITY".to_string(), "6".to_string());
 
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 45).unwrap();
         let entry = LogEntry::new(timestamp, fields);
@@ -263,5 +434,99 @@ mod tests {
 
         let retrieved = buffer.get_entries_for_minute(minute_key).unwrap();
         assert_eq!(retrieved.len(), 0);
+    }
+
+    #[test]
+    fn test_field_extraction_type_conversions() {
+        let mut buffer = DuckDBBuffer::new().unwrap();
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("MESSAGE".to_string(), "Test message".to_string());
+        fields.insert("PRIORITY".to_string(), "6".to_string());
+        fields.insert("_PID".to_string(), "1234".to_string());
+        fields.insert("_UID".to_string(), "1000".to_string());
+        fields.insert("_GID".to_string(), "1000".to_string());
+        // Invalid integer values should become NULL
+        fields.insert("INVALID_PRIORITY".to_string(), "invalid".to_string());
+
+        let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 45).unwrap();
+        let entry = LogEntry::new(timestamp, fields);
+
+        buffer.add_entry(&entry).unwrap();
+
+        let minute_key = entry.minute_key();
+        let retrieved = buffer.get_entries_for_minute(minute_key).unwrap();
+        assert_eq!(retrieved.len(), 1);
+
+        let fields_obj = retrieved[0].1.as_object().unwrap();
+        assert_eq!(
+            fields_obj.get("MESSAGE").unwrap().as_str().unwrap(),
+            "Test message"
+        );
+        assert_eq!(fields_obj.get("PRIORITY").unwrap().as_str().unwrap(), "6");
+        assert_eq!(fields_obj.get("_PID").unwrap().as_str().unwrap(), "1234");
+        assert_eq!(fields_obj.get("_UID").unwrap().as_str().unwrap(), "1000");
+        assert_eq!(fields_obj.get("_GID").unwrap().as_str().unwrap(), "1000");
+    }
+
+    #[test]
+    fn test_extra_fields_preservation() {
+        let mut buffer = DuckDBBuffer::new().unwrap();
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("MESSAGE".to_string(), "Test message".to_string());
+        fields.insert("CUSTOM_FIELD_1".to_string(), "custom value 1".to_string());
+        fields.insert("CUSTOM_FIELD_2".to_string(), "custom value 2".to_string());
+
+        let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 45).unwrap();
+        let entry = LogEntry::new(timestamp, fields);
+
+        buffer.add_entry(&entry).unwrap();
+
+        let minute_key = entry.minute_key();
+        let retrieved = buffer.get_entries_for_minute(minute_key).unwrap();
+        assert_eq!(retrieved.len(), 1);
+
+        let fields_obj = retrieved[0].1.as_object().unwrap();
+        assert_eq!(
+            fields_obj.get("MESSAGE").unwrap().as_str().unwrap(),
+            "Test message"
+        );
+        assert_eq!(
+            fields_obj.get("CUSTOM_FIELD_1").unwrap().as_str().unwrap(),
+            "custom value 1"
+        );
+        assert_eq!(
+            fields_obj.get("CUSTOM_FIELD_2").unwrap().as_str().unwrap(),
+            "custom value 2"
+        );
+    }
+
+    #[test]
+    fn test_nullable_fields_handling() {
+        let mut buffer = DuckDBBuffer::new().unwrap();
+
+        let mut fields = std::collections::HashMap::new();
+        // Only include MESSAGE, other fields should be NULL
+        fields.insert("MESSAGE".to_string(), "Test message".to_string());
+
+        let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 45).unwrap();
+        let entry = LogEntry::new(timestamp, fields);
+
+        buffer.add_entry(&entry).unwrap();
+
+        let minute_key = entry.minute_key();
+        let retrieved = buffer.get_entries_for_minute(minute_key).unwrap();
+        assert_eq!(retrieved.len(), 1);
+
+        let fields_obj = retrieved[0].1.as_object().unwrap();
+        assert_eq!(
+            fields_obj.get("MESSAGE").unwrap().as_str().unwrap(),
+            "Test message"
+        );
+        // Other common fields should not be present since they were NULL
+        assert!(fields_obj.get("PRIORITY").is_none());
+        assert!(fields_obj.get("_PID").is_none());
+        assert!(fields_obj.get("_SYSTEMD_UNIT").is_none());
     }
 }
