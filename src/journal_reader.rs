@@ -170,11 +170,17 @@ impl JournalLogReader {
             Ok(Some(entry)) => {
                 let log_entry = self.convert_journal_entry(&entry)?;
 
-                // Print all fields of each journal message for real-time processing
-                info!("Real-time Journal Entry {}:", log_entry.timestamp);
-                for (key, value) in &log_entry.fields {
-                    info!("  {}: {}", key, value);
-                }
+                // Print all fields on a single line for real-time processing
+                let fields_vec: Vec<String> = log_entry
+                    .fields
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect();
+                info!(
+                    "Real-time Entry {} {}",
+                    log_entry.timestamp,
+                    fields_vec.join(" ")
+                );
 
                 Ok(Some(log_entry))
             }
@@ -211,11 +217,17 @@ impl JournalLogReader {
             match self.journal.previous_entry() {
                 Ok(Some(entry)) => {
                     if let Ok(log_entry) = self.convert_journal_entry(&entry) {
-                        // Print all fields of each journal message
-                        info!("Journal Entry {}:", log_entry.timestamp);
-                        for (key, value) in &log_entry.fields {
-                            info!("  {}: {}", key, value);
-                        }
+                        // Print all fields on a single line
+                        let fields_vec: Vec<String> = log_entry
+                            .fields
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect();
+                        info!(
+                            "Journal Entry {} {}",
+                            log_entry.timestamp,
+                            fields_vec.join(" ")
+                        );
 
                         if log_entry.timestamp >= cutoff_timestamp
                             && log_entry.timestamp <= Utc::now()
