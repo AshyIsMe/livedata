@@ -54,13 +54,19 @@ impl ParquetWriter {
         Ok(dir_path)
     }
 
-    pub fn generate_filename(timestamp: DateTime<Utc>) -> String {
-        timestamp.format("%Y%m%d-%H%M.parquet").to_string()
+    pub fn generate_filename(timestamp: DateTime<Utc>, data_source: &str) -> String {
+        timestamp
+            .format(&format!("%Y%m%d-%H%M-{}.parquet", data_source))
+            .to_string()
     }
 
-    pub fn get_filepath_for_minute(&self, minute_key: DateTime<Utc>) -> Result<PathBuf> {
+    pub fn get_filepath_for_minute(
+        &self,
+        minute_key: DateTime<Utc>,
+        data_source: &str,
+    ) -> Result<PathBuf> {
         let dir_path = self.create_directory_structure(minute_key)?;
-        let filename = Self::generate_filename(minute_key);
+        let filename = Self::generate_filename(minute_key, data_source);
         Ok(dir_path.join(filename))
     }
 
@@ -68,8 +74,9 @@ impl ParquetWriter {
         &mut self,
         buffer: &mut DuckDBBuffer,
         minute_key: DateTime<Utc>,
+        data_source: &str,
     ) -> Result<WriteResult> {
-        let filepath = self.get_filepath_for_minute(minute_key)?;
+        let filepath = self.get_filepath_for_minute(minute_key, data_source)?;
 
         // Check if file already exists
         if filepath.exists() {
@@ -137,8 +144,9 @@ impl ParquetWriter {
         &mut self,
         buffer: &mut DuckDBBuffer,
         minute_key: DateTime<Utc>,
+        data_source: &str,
     ) -> Result<WriteResult> {
-        let write_result = self.write_minute_to_parquet(buffer, minute_key)?;
+        let write_result = self.write_minute_to_parquet(buffer, minute_key, data_source)?;
 
         if !write_result.skipped {
             // Delete the exported entries from buffer
@@ -175,7 +183,7 @@ impl ParquetWriter {
             if current_time >= completion_time {
                 debug!("Processing completed minute: {}", minute_key);
 
-                match self.write_and_cleanup_minute(buffer, minute_key) {
+                match self.write_and_cleanup_minute(buffer, minute_key, "journald") {
                     Ok(result) => {
                         if !result.skipped {
                             info!(
@@ -205,7 +213,7 @@ impl ParquetWriter {
         for minute_key in buffered_minutes {
             debug!("Flushing minute: {}", minute_key);
 
-            match self.write_and_cleanup_minute(buffer, minute_key) {
+            match self.write_and_cleanup_minute(buffer, minute_key, "journald") {
                 Ok(result) => {
                     if !result.skipped {
                         info!(
@@ -318,8 +326,8 @@ mod tests {
     #[test]
     fn test_filename_generation() {
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 0).unwrap();
-        let filename = ParquetWriter::generate_filename(timestamp);
-        assert_eq!(filename, "20260117-1430.parquet");
+        let filename = ParquetWriter::generate_filename(timestamp, "journald");
+        assert_eq!(filename, "20260117-1430-journald.parquet");
     }
 
     #[test]
@@ -328,7 +336,9 @@ mod tests {
         let writer = ParquetWriter::new(&temp_dir.path()).unwrap();
 
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 0).unwrap();
-        let filepath = writer.get_filepath_for_minute(timestamp).unwrap();
+        let filepath = writer
+            .get_filepath_for_minute(timestamp, "journald")
+            .unwrap();
 
         let expected_path = temp_dir
             .path()
@@ -336,7 +346,7 @@ mod tests {
             .join("2026")
             .join("01")
             .join("17")
-            .join("20260117-1430.parquet");
+            .join("20260117-1430-journald.parquet");
 
         assert_eq!(filepath, expected_path);
     }
