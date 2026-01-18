@@ -57,13 +57,19 @@ impl ApplicationController {
         Ok(())
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self, follow: bool) -> Result<()> {
         info!("Starting journald to parquet log collection");
 
         self.setup_signal_handler()?;
 
-        // Process historical data from the last hour on startup
-        self.process_startup_historical_data()?;
+        // Process historical data from the last hour on startup (unless in follow mode)
+        if !follow {
+            self.process_startup_historical_data()?;
+        } else {
+            // In follow mode, just seek to tail for real-time monitoring
+            self.journal_reader.seek_to_tail()?;
+            info!("Follow mode: starting real-time monitoring from now");
+        }
 
         self.flush_all_minutes()?;
 

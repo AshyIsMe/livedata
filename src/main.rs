@@ -1,7 +1,20 @@
 use anyhow::Result;
+use clap::Parser;
 use livedata::app_controller::ApplicationController;
 use log::info;
-use std::env;
+
+/// livedata - Journald to parquet log collector
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Data directory for storing parquet files
+    #[arg(short, long, default_value = "./data")]
+    data_dir: String,
+
+    /// Follow mode: don't process historical data, just start following from now
+    #[arg(short = 'f', long)]
+    follow: bool,
+}
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -11,14 +24,17 @@ fn main() -> Result<()> {
 
     info!("Starting journald to parquet log collector");
 
-    // Get data directory from command line args or use default
-    let data_dir = env::args().nth(1).unwrap_or_else(|| "./data".to_string());
+    // Parse command line arguments
+    let args = Args::parse();
 
-    info!("Using data directory: {}", data_dir);
+    info!("Using data directory: {}", args.data_dir);
+    if args.follow {
+        info!("Follow mode enabled: skipping historical data processing");
+    }
 
     // Create and run the application
-    let mut app = ApplicationController::new(&data_dir)?;
-    app.run()?;
+    let mut app = ApplicationController::new(&args.data_dir)?;
+    app.run(args.follow)?;
 
     info!("Application shutdown complete");
     Ok(())
