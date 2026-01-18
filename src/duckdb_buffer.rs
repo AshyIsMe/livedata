@@ -18,8 +18,8 @@ impl DuckDBBuffer {
         // Create the main table for journal logs with proper data types
         conn.execute(
             "CREATE TABLE journal_logs (
-                timestamp TIMESTAMP NOT NULL,
-                minute_key TIMESTAMP NOT NULL,
+                timestamp VARCHAR NOT NULL,
+                minute_key VARCHAR NOT NULL,
                 message TEXT,
                 priority INTEGER,
                 systemd_unit TEXT,
@@ -104,8 +104,8 @@ impl DuckDBBuffer {
                 pid, exe, syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
-                entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                minute_key.format("%Y-%m-%d %H:%M:%S").to_string(),
+                entry.timestamp.to_rfc3339(),
+                minute_key.to_rfc3339(),
                 message,
                 priority,
                 systemd_unit,
@@ -134,16 +134,15 @@ impl DuckDBBuffer {
                     syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields 
              FROM journal_logs WHERE minute_key = ? ORDER BY timestamp",
         )?;
-        let mut rows = stmt.query(params![minute_key.format("%Y-%m-%d %H:%M:%S").to_string()])?;
+        let mut rows = stmt.query(params![minute_key.to_rfc3339()])?;
 
         while let Some(row) = rows.next()? {
             let timestamp_str: String = row.get(0)?;
-            let timestamp: DateTime<Utc> =
-                DateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S")
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to parse timestamp '{}': {}", timestamp_str, e)
-                    })?
-                    .with_timezone(&Utc);
+            let timestamp: DateTime<Utc> = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to parse timestamp '{}': {}", timestamp_str, e)
+                })?
+                .with_timezone(&Utc);
 
             // Reconstruct the original fields structure
             let mut fields = serde_json::Map::new();
@@ -226,7 +225,7 @@ impl DuckDBBuffer {
     pub fn delete_minute(&mut self, minute_key: DateTime<Utc>) -> Result<usize> {
         let rows_deleted = self.conn.execute(
             "DELETE FROM journal_logs WHERE minute_key = ?",
-            params![minute_key.format("%Y-%m-%d %H:%M:%S").to_string()],
+            params![minute_key.to_rfc3339()],
         )?;
         Ok(rows_deleted)
     }
@@ -240,12 +239,11 @@ impl DuckDBBuffer {
 
         while let Some(row) = rows.next()? {
             let minute_key_str: String = row.get(0)?;
-            let minute_key: DateTime<Utc> =
-                DateTime::parse_from_str(&minute_key_str, "%Y-%m-%d %H:%M:%S")
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to parse minute_key '{}': {}", minute_key_str, e)
-                    })?
-                    .with_timezone(&Utc);
+            let minute_key: DateTime<Utc> = DateTime::parse_from_rfc3339(&minute_key_str)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to parse minute_key '{}': {}", minute_key_str, e)
+                })?
+                .with_timezone(&Utc);
             minutes.insert(minute_key);
         }
 
@@ -267,7 +265,7 @@ impl DuckDBBuffer {
         let mut stmt = self
             .conn
             .prepare("SELECT COUNT(*) FROM journal_logs WHERE minute_key = ?")?;
-        let mut rows = stmt.query(params![minute_key.format("%Y-%m-%d %H:%M:%S").to_string()])?;
+        let mut rows = stmt.query(params![minute_key.to_rfc3339()])?;
 
         if let Some(row) = rows.next()? {
             Ok(row.get(0)?)
@@ -286,9 +284,9 @@ impl DuckDBBuffer {
             let minute_key_str: Option<String> = row.get(0)?;
             match minute_key_str {
                 Some(s) => {
-                    let dt = DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                    let dt = DateTime::parse_from_rfc3339(&s)
                         .map_err(|e| {
-                            anyhow::anyhow!("Failed to parse oldest minute_key '{}': {}", s, e)
+                            anyhow::anyhow!("Failed to parse newest minute_key '{}': {}", s, e)
                         })?
                         .with_timezone(&Utc);
                     Ok(Some(dt))
@@ -310,9 +308,9 @@ impl DuckDBBuffer {
             let minute_key_str: Option<String> = row.get(0)?;
             match minute_key_str {
                 Some(s) => {
-                    let dt = DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                    let dt = DateTime::parse_from_rfc3339(&s)
                         .map_err(|e| {
-                            anyhow::anyhow!("Failed to parse newest minute_key '{}': {}", s, e)
+                            anyhow::anyhow!("Failed to parse oldest minute_key '{}': {}", s, e)
                         })?
                         .with_timezone(&Utc);
                     Ok(Some(dt))
