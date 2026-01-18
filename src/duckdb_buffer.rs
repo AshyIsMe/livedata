@@ -1,6 +1,6 @@
 use crate::log_entry::LogEntry;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use duckdb::{Connection, params};
 use log::{debug, info};
 use serde_json::Value;
@@ -18,7 +18,7 @@ impl DuckDBBuffer {
         // Create the main table for journal logs with proper data types
         conn.execute(
             "CREATE TABLE journal_logs (
-                timestamp VARCHAR NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
                 minute_key VARCHAR NOT NULL,
                 message TEXT,
                 priority INTEGER,
@@ -130,19 +130,20 @@ impl DuckDBBuffer {
     ) -> Result<Vec<(DateTime<Utc>, Value)>> {
         let mut entries = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, message, priority, systemd_unit, hostname, pid, exe, 
-                    syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields 
-             FROM journal_logs WHERE minute_key = ? ORDER BY timestamp",
+            "SELECT CAST(timestamp AS VARCHAR), message, priority, systemd_unit, hostname, pid, exe,
+                    syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields
+              FROM journal_logs WHERE minute_key = ? ORDER BY timestamp",
         )?;
         let mut rows = stmt.query(params![minute_key.to_rfc3339()])?;
 
         while let Some(row) = rows.next()? {
             let timestamp_str: String = row.get(0)?;
-            let timestamp: DateTime<Utc> = DateTime::parse_from_rfc3339(&timestamp_str)
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to parse timestamp '{}': {}", timestamp_str, e)
-                })?
-                .with_timezone(&Utc);
+            let naive_dt =
+                chrono::NaiveDateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to parse timestamp '{}': {}", timestamp_str, e)
+                    })?;
+            let timestamp: DateTime<Utc> = DateTime::from_naive_utc_and_offset(naive_dt, Utc);
 
             // Reconstruct the original fields structure
             let mut fields = serde_json::Map::new();
