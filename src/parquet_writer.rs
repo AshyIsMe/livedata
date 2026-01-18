@@ -98,7 +98,7 @@ impl ParquetWriter {
         let copy_sql = format!(
             "COPY (SELECT timestamp, fields FROM journal_logs WHERE minute_key = '{}' ORDER BY timestamp) 
              TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
-            minute_key.format("%Y-%m-%d %H:%M:%S"),
+            minute_key.to_rfc3339(),
             filepath.display()
         );
 
