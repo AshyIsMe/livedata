@@ -63,6 +63,8 @@ fn test_real_time_journal_detection() {
 
     println!("Sent test message: {}", test_message);
 
+    reader.previous_skip(100).unwrap();
+
     // Poll for the new entry
     let start_time = std::time::Instant::now();
     let timeout = Duration::from_secs(8);

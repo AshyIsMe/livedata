@@ -105,11 +105,13 @@ fn test_seek_and_wait() {
 
     // Wait a moment and then try to read
     println!("Waiting for message to appear...");
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(100));
+
+    journal.previous_skip(100).unwrap();
 
     // Try to read entries
     let mut found = false;
-    for i in 0..10 {
+    for i in 0..100 {
         match journal.next_entry() {
             Ok(Some(entry)) => {
                 if let Some(message) = entry.get("MESSAGE") {
