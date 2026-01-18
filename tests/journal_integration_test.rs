@@ -137,7 +137,17 @@ fn test_simple_journal_polling() {
         return;
     }
 
-    // Send a test message first
+    // Create a reader and seek to tail
+    let mut reader = match JournalLogReader::new() {
+        Ok(r) => r,
+        Err(e) => {
+            println!("Failed to create journal reader: {}", e);
+            return;
+        }
+    };
+    reader.seek_to_tail().unwrap();
+
+    // Send a test message
     let test_message = "simple polling test message";
     if let Err(e) = send_test_message(test_message) {
         println!("Failed to send test message: {}", e);
@@ -147,20 +157,15 @@ fn test_simple_journal_polling() {
     // Give it time to be written to journal
     thread::sleep(Duration::from_millis(1000));
 
-    // Create a reader and don't seek to tail - read from current position
-    let mut reader = match JournalLogReader::new() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("Failed to create journal reader: {}", e);
-            return;
-        }
-    };
+    reader.previous_skip(100).unwrap();
+
 
     // Read some entries and look for our message
     println!("Searching for message: {}", test_message);
     let mut found = false;
 
-    for i in 0..50 {
+    let mut i = 0;
+    loop {
         // Check up to 50 entries
         match reader.next_entry() {
             Ok(Some(entry)) => {
@@ -182,6 +187,7 @@ fn test_simple_journal_polling() {
                 break;
             }
         }
+        i += 1;
     }
 
     assert!(found, "Test message not found in journal");

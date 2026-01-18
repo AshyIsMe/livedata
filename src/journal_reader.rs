@@ -35,6 +35,14 @@ impl JournalLogReader {
         Ok(())
     }
 
+    pub fn previous_skip(&mut self, skip_count: u64) -> Result<()> {
+        info!("previous_skip({})", skip_count);
+        self.journal
+            .previous_skip(skip_count)
+            .map_err(|e| anyhow!("Failed to previous_skip: {}", e))?;
+        Ok(())
+    }
+
     pub fn seek_to_timestamp(&mut self, timestamp: DateTime<Utc>) -> Result<()> {
         info!("Seeking to timestamp: {}", timestamp);
 
