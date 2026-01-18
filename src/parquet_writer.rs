@@ -107,7 +107,7 @@ impl ParquetWriter {
                     pid, exe, syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields 
              FROM journal_logs WHERE minute_key = '{}' ORDER BY timestamp) 
              TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
-            minute_key,
+            minute_key.format("%Y-%m-%d %H:%M:%S"),
             filepath.display()
         );
 
