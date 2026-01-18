@@ -65,6 +65,8 @@ impl ApplicationController {
         // Process historical data from the last hour on startup
         self.process_startup_historical_data()?;
 
+        self.flush_all_minutes()?;
+
         let mut last_flush_time = Utc::now();
         let flush_interval = TimeDelta::seconds(30); // Check for completed minutes every 30 seconds
 
@@ -193,6 +195,30 @@ impl ApplicationController {
             );
         }
 
+        Ok(())
+    }
+
+    fn flush_all_minutes(&mut self) -> Result<()> {
+        match self.parquet_writer.flush_all_minutes(&mut self.buffer) {
+            Ok(results) => {
+                if !results.is_empty() {
+                    let total_entries: i64 = results.iter().map(|r| r.entries_written).sum();
+                    let total_bytes: u64 = results.iter().map(|r| r.bytes_written).sum();
+
+                    info!(
+                        "Final flush: {} minutes, {} entries ({} bytes)",
+                        results.len(),
+                        total_entries,
+                        total_bytes
+                    );
+                } else {
+                    info!("No remaining data to flush");
+                }
+            }
+            Err(e) => {
+                error!("Failed to flush remaining data: {}", e);
+            }
+        }
         Ok(())
     }
 

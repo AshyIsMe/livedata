@@ -57,7 +57,6 @@ fn test_simple_journal_polling() {
 
     reader.previous_skip(100).unwrap();
 
-
     // Read some entries and look for our message
     println!("Searching for message: {}", test_message);
     let mut found = false;

@@ -175,15 +175,17 @@ impl ParquetWriter {
         buffer: &mut DuckDBBuffer,
         current_time: DateTime<Utc>,
     ) -> Result<Vec<WriteResult>> {
+        info!("write_completed_minutes()");
         let mut results = Vec::new();
         let buffered_minutes = buffer.get_buffered_minutes()?;
+        info!("buffered_minutes: {:#?}", buffered_minutes);
 
         for minute_key in buffered_minutes {
             // Check if this minute is completed (current time > minute + 60 seconds)
-            let completion_time = minute_key + chrono::Duration::seconds(60);
+            let completion_time = minute_key + chrono::Duration::seconds(59);
 
             if current_time >= completion_time {
-                debug!("Processing completed minute: {}", minute_key);
+                info!("Processing completed minute: {}", minute_key);
 
                 match self.write_and_cleanup_minute(buffer, minute_key, "journald") {
                     Ok(result) => {
