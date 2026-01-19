@@ -101,11 +101,33 @@ impl ParquetWriter {
         // Use buffer's connection for export
         let export_conn = &buffer.conn;
 
-        // Use DuckDB's COPY command to export to parquet with new schema
+        // Use DuckDB's COPY command to export to parquet with all systemd fields
         let copy_sql = format!(
-            "COPY (SELECT timestamp, minute_key, message, priority, systemd_unit, hostname, 
-                    pid, exe, syslog_identifier, syslog_facility, _uid, _gid, _comm, extra_fields 
-             FROM journal_logs WHERE minute_key = '{}' ORDER BY timestamp) 
+            "COPY (SELECT timestamp, minute_key,
+                    -- User journal fields
+                    message, message_id, priority, code_file, code_line, code_func, errno,
+                    invocation_id, user_invocation_id, syslog_facility, syslog_identifier,
+                    syslog_pid, syslog_timestamp, syslog_raw, documentation, tid, unit, user_unit,
+                    -- Trusted journal fields
+                    _pid, _uid, _gid, _comm, _exe, _cmdline, _cap_effective, _audit_session,
+                    _audit_loginuid, _systemd_cgroup, _systemd_slice, _systemd_unit,
+                    _systemd_user_unit, _systemd_user_slice, _systemd_session, _systemd_owner_uid,
+                    _selinux_context, _source_realtime_timestamp, _source_boottime_timestamp,
+                    _boot_id, _machine_id, _systemd_invocation_id, _hostname, _transport,
+                    _stream_id, _line_break, _namespace, _runtime_scope,
+                    -- Kernel journal fields
+                    _kernel_device, _kernel_subsystem, _udev_sysname, _udev_devnode, _udev_devlink,
+                    -- Fields to log on behalf of another program
+                    coredump_unit, coredump_user_unit, object_pid, object_uid, object_gid,
+                    object_comm, object_exe, object_cmdline, object_audit_session,
+                    object_audit_loginuid, object_systemd_cgroup, object_systemd_session,
+                    object_systemd_owner_uid, object_systemd_unit, object_systemd_user_unit,
+                    object_systemd_invocation_id,
+                    -- Address fields
+                    __cursor, __realtime_timestamp, __monotonic_timestamp, __seqnum, __seqnum_id,
+                    -- Extra fields
+                    extra_fields
+             FROM journal_logs WHERE minute_key = '{}' ORDER BY timestamp)
              TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
             minute_key.to_rfc3339(),
             filepath.display()

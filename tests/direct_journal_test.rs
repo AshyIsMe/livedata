@@ -1,8 +1,7 @@
-use livedata::journal_reader::JournalLogReader;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use systemd::journal::{Journal, OpenOptions};
+use systemd::journal::OpenOptions;
 
 #[test]
 fn test_direct_journal_access() {
@@ -38,7 +37,7 @@ fn test_direct_journal_access() {
     println!("Reading entries from journal...");
     let mut entries_read = 0;
 
-    for i in 0..10 {
+    for _ in 0..10 {
         match journal.next_entry() {
             Ok(Some(entry)) => {
                 entries_read += 1;
@@ -111,7 +110,7 @@ fn test_seek_and_wait() {
 
     // Try to read entries
     let mut found = false;
-    for i in 0..100 {
+    for _ in 0..100 {
         match journal.next_entry() {
             Ok(Some(entry)) => {
                 if let Some(message) = entry.get("MESSAGE") {

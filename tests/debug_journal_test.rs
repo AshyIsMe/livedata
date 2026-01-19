@@ -1,7 +1,5 @@
 use livedata::journal_reader::JournalLogReader;
-use livedata::log_entry::LogEntry;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 

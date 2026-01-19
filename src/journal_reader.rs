@@ -98,9 +98,9 @@ impl JournalLogReader {
         Ok(skipped_count)
     }
 
-    pub fn wait_for_entry(&mut self) -> Result<bool> {
+    pub fn wait_for_entry(&mut self, timeout: Option<std::time::Duration>) -> Result<bool> {
         // Wait for entries to become available
-        match self.journal.wait(None) {
+        match self.journal.wait(timeout) {
             Ok(systemd::journal::JournalWaitResult::Nop) => {
                 // No new entries, but call was successful
                 Ok(false)

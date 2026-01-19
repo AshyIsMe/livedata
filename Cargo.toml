@@ -23,3 +23,6 @@ arrow = "57.2.0"
 rustflags = [
     "-C", "link-arg=-fuse-ld=lld",
 ]
+
+[profile.dev.package.duckdb]
+opt-level = 3
