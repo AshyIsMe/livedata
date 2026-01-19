@@ -68,10 +68,10 @@ impl ApplicationController {
         } else {
             // In follow mode, just seek to tail for real-time monitoring
             self.journal_reader.seek_to_tail()?;
+            // Position cursor at the last entry so next_entry() can read new entries
+            self.journal_reader.previous_skip(1)?;
             info!("Follow mode: starting real-time monitoring from now");
         }
-
-        self.flush_all_minutes()?;
 
         let mut last_flush_time = Utc::now();
         let flush_interval = TimeDelta::seconds(30); // Check for completed minutes every 30 seconds
@@ -85,20 +85,16 @@ impl ApplicationController {
                 break;
             }
 
-            // Process any new journal entries
-            match self.journal_reader.next_log_entry() {
-                Ok(Some(entry)) => {
+            // Wait for new journal entries with a short timeout
+            if self
+                .journal_reader
+                .wait_for_entry(Some(Duration::from_millis(100)))?
+            {
+                // Process any new journal entries
+                while let Ok(Some(entry)) = self.journal_reader.next_log_entry() {
                     if let Err(e) = self.process_log_entry(entry) {
                         error!("Failed to process log entry: {}", e);
                     }
-                }
-                Ok(None) => {
-                    // No new entries, just continue
-                }
-                Err(e) => {
-                    error!("Error reading from journal: {}", e);
-                    // Wait a bit before retrying
-                    thread::sleep(Duration::from_secs(1));
                 }
             }
 
@@ -168,6 +164,9 @@ impl ApplicationController {
 
         // Now seek to tail for real-time monitoring
         self.journal_reader.seek_to_tail()?;
+        // Position cursor at the last entry so next_entry() can read new entries
+        // Without this, the cursor is "past the end" and next_entry() won't work
+        self.journal_reader.previous_skip(1)?;
         info!("Completed historical data processing, starting real-time monitoring");
 
         Ok(())
@@ -201,30 +200,6 @@ impl ApplicationController {
             );
         }
 
-        Ok(())
-    }
-
-    fn flush_all_minutes(&mut self) -> Result<()> {
-        match self.parquet_writer.flush_all_minutes(&mut self.buffer) {
-            Ok(results) => {
-                if !results.is_empty() {
-                    let total_entries: i64 = results.iter().map(|r| r.entries_written).sum();
-                    let total_bytes: u64 = results.iter().map(|r| r.bytes_written).sum();
-
-                    info!(
-                        "Final flush: {} minutes, {} entries ({} bytes)",
-                        results.len(),
-                        total_entries,
-                        total_bytes
-                    );
-                } else {
-                    info!("No remaining data to flush");
-                }
-            }
-            Err(e) => {
-                error!("Failed to flush remaining data: {}", e);
-            }
-        }
         Ok(())
     }
 
