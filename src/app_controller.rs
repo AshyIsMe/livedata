@@ -354,14 +354,14 @@ mod tests {
     #[test]
     fn test_application_controller_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let result = ApplicationController::new(&temp_dir.path());
+        let result = ApplicationController::new(temp_dir.path());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_status_retrieval() {
         let temp_dir = TempDir::new().unwrap();
-        let mut controller = ApplicationController::new(&temp_dir.path()).unwrap();
+        let mut controller = ApplicationController::new(temp_dir.path()).unwrap();
 
         let status = controller.get_status().unwrap();
         assert_eq!(status.total_buffered_entries, 0);

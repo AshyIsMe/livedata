@@ -9,7 +9,7 @@ fn test_simple_journal_read() {
 
     // First, send a test message
     let test_message = "simple test message";
-    if let Ok(_) = Command::new("logger").arg(test_message).output() {
+    if Command::new("logger").arg(test_message).output().is_ok() {
         println!("Sent test message: {}", test_message);
     }
 
@@ -51,7 +51,7 @@ fn test_journal_from_head() {
 
     // Send a test message first
     let test_message = "head test message";
-    if let Ok(_) = Command::new("logger").arg(test_message).output() {
+    if Command::new("logger").arg(test_message).output().is_ok() {
         println!("Sent test message: {}", test_message);
     }
 
@@ -79,12 +79,12 @@ fn test_journal_from_head() {
         match reader.next_entry() {
             Ok(Some(entry)) => {
                 entries_checked += 1;
-                if let Some(message) = entry.get_message() {
-                    if message.contains(test_message) {
-                        println!("Found our test message: {}", message);
-                        found_recent = true;
-                        break;
-                    }
+                if let Some(message) = entry.get_message()
+                    && message.contains(test_message)
+                {
+                    println!("Found our test message: {}", message);
+                    found_recent = true;
+                    break;
                 }
 
                 // Check if this is a recent entry (within last minute)

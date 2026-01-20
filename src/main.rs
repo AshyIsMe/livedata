@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use livedata::app_controller::ApplicationController;
+use livedata::web_server::run_web_server;
 use log::info;
+use std::thread;
 
 /// livedata - Journald to parquet log collector
 #[derive(Parser, Debug)]
@@ -14,6 +16,15 @@ struct Args {
     /// Follow mode: don't process historical data, just start following from now
     #[arg(short = 'f', long)]
     follow: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Parser, Debug)]
+enum Commands {
+    /// Run the web server
+    Web,
 }
 
 fn main() -> Result<()> {
@@ -32,9 +43,26 @@ fn main() -> Result<()> {
         info!("Follow mode enabled: skipping historical data processing");
     }
 
-    // Create and run the application
-    let mut app = ApplicationController::new(&args.data_dir)?;
-    app.run(args.follow)?;
+    // Check if the web subcommand is present
+    if let Some(Commands::Web) = args.command {
+        // Run the web server in a separate thread
+        let data_dir = args.data_dir.clone();
+        let web_server_handle = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(run_web_server(&data_dir));
+        });
+
+        // Create and run the application in the main thread
+        let mut app = ApplicationController::new(&args.data_dir)?;
+        app.run(args.follow)?;
+
+        // Wait for the web server to finish
+        web_server_handle.join().unwrap();
+    } else {
+        // Create and run the application in the main thread
+        let mut app = ApplicationController::new(&args.data_dir)?;
+        app.run(args.follow)?;
+    }
 
     info!("Application shutdown complete");
     Ok(())

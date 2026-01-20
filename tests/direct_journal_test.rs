@@ -9,7 +9,7 @@ fn test_direct_journal_access() {
 
     // Send a test message first
     let test_message = "direct access test message";
-    if let Ok(_) = Command::new("logger").arg(test_message).output() {
+    if Command::new("logger").arg(test_message).output().is_ok() {
         println!("Sent test message: {}", test_message);
     }
 
@@ -98,7 +98,7 @@ fn test_seek_and_wait() {
     println!("Seeked to tail, sending test message...");
 
     // Send test message
-    if let Ok(_) = Command::new("logger").arg(test_message).output() {
+    if Command::new("logger").arg(test_message).output().is_ok() {
         println!("Sent test message: {}", test_message);
     }
 

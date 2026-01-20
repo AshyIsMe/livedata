@@ -18,6 +18,10 @@ clap = { version = "4.0", features = ["derive"] }  # command line argument parsi
 signal-hook = "0.3"        # signal handling
 tempfile = "3.24"            # temporary directories for tests
 arrow = "57.2.0"
+axum = "0.8.8"
+tower-http = { version = "0.6.8", features = ["fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = [

@@ -621,15 +621,12 @@ impl DuckDBBuffer {
             add_field!("__SEQNUM_ID", 73, i64);
 
             // Add extra fields if they exist
-            if let Some(extra_fields_json) = row.get::<_, Option<String>>(74)? {
-                if let Ok(extra_fields) =
+            if let Some(extra_fields_json) = row.get::<_, Option<String>>(74)?
+                && let Ok(serde_json::Value::Object(extra_map)) =
                     serde_json::from_str::<serde_json::Value>(&extra_fields_json)
-                {
-                    if let serde_json::Value::Object(extra_map) = extra_fields {
-                        for (key, value) in extra_map {
-                            fields.insert(key, value);
-                        }
-                    }
+            {
+                for (key, value) in extra_map {
+                    fields.insert(key, value);
                 }
             }
 

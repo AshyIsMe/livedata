@@ -325,14 +325,14 @@ mod tests {
     #[test]
     fn test_parquet_writer_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let result = ParquetWriter::new(&temp_dir.path());
+        let result = ParquetWriter::new(temp_dir.path());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_directory_structure() {
         let temp_dir = TempDir::new().unwrap();
-        let writer = ParquetWriter::new(&temp_dir.path()).unwrap();
+        let writer = ParquetWriter::new(temp_dir.path()).unwrap();
 
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 0).unwrap();
         let dir_path = writer.create_directory_structure(timestamp).unwrap();
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn test_filepath_generation() {
         let temp_dir = TempDir::new().unwrap();
-        let writer = ParquetWriter::new(&temp_dir.path()).unwrap();
+        let writer = ParquetWriter::new(temp_dir.path()).unwrap();
 
         let timestamp = Utc.with_ymd_and_hms(2026, 1, 17, 14, 30, 0).unwrap();
         let filepath = writer
