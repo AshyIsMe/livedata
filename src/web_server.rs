@@ -287,9 +287,7 @@ async fn api_search(
                 timestamp: row.get::<_, String>(0)?,
                 hostname: row.get::<_, Option<String>>(1)?,
                 unit: row.get::<_, Option<String>>(2)?,
-                priority: row
-                    .get::<_, Option<String>>(3)?
-                    .and_then(|s| s.parse().ok()),
+                priority: row.get::<_, Option<i32>>(3)?,
                 pid: row.get::<_, Option<String>>(4)?,
                 comm: row.get::<_, Option<String>>(5)?,
                 message: row.get::<_, Option<String>>(6)?,
@@ -459,9 +457,7 @@ async fn search_ui(
                     timestamp: row.get::<_, String>(0)?,
                     hostname: row.get::<_, Option<String>>(1)?,
                     unit: row.get::<_, Option<String>>(2)?,
-                    priority: row
-                        .get::<_, Option<String>>(3)?
-                        .and_then(|s| s.parse().ok()),
+                    priority: row.get::<_, Option<i32>>(3)?,
                     pid: row.get::<_, Option<String>>(4)?,
                     comm: row.get::<_, Option<String>>(5)?,
                     message: row.get::<_, Option<String>>(6)?,
