@@ -68,7 +68,7 @@ fn default_limit() -> usize {
 }
 
 /// Search result entry
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     pub timestamp: String,
     pub hostname: Option<String>,
@@ -80,7 +80,7 @@ pub struct SearchResult {
 }
 
 /// Search response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub total: usize,
@@ -90,21 +90,21 @@ pub struct SearchResponse {
 }
 
 /// Filter values response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FilterValues {
     pub hostnames: Vec<String>,
     pub units: Vec<String>,
     pub priorities: Vec<PriorityOption>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PriorityOption {
     pub value: u8,
     pub label: String,
 }
 
 /// Health check response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub data_dir: String,
@@ -274,38 +274,46 @@ async fn api_search(
 
     // Execute query
     let conn = state.conn.lock().unwrap();
-    let mut stmt = conn.prepare(&sql).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Query error: {}", e),
-        )
-    })?;
 
-    let results: Vec<SearchResult> = stmt
-        .query_map([], |row| {
-            Ok(SearchResult {
-                timestamp: row.get::<_, String>(0)?,
-                hostname: row.get::<_, Option<String>>(1)?,
-                unit: row.get::<_, Option<String>>(2)?,
-                priority: row.get::<_, Option<i32>>(3)?,
-                pid: row.get::<_, Option<String>>(4)?,
-                comm: row.get::<_, Option<String>>(5)?,
-                message: row.get::<_, Option<String>>(6)?,
+    // Handle case where no parquet files exist (returns empty results)
+    let results: Vec<SearchResult> = match conn.prepare(&sql) {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| {
+                Ok(SearchResult {
+                    timestamp: row.get::<_, String>(0)?,
+                    hostname: row.get::<_, Option<String>>(1)?,
+                    unit: row.get::<_, Option<String>>(2)?,
+                    priority: row.get::<_, Option<i32>>(3)?,
+                    pid: row.get::<_, Option<String>>(4)?,
+                    comm: row.get::<_, Option<String>>(5)?,
+                    message: row.get::<_, Option<String>>(6)?,
+                })
             })
-        })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Query error: {}", e),
-            )
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Query error: {}", e),
-            )
-        })?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Query error: {}", e),
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Query error: {}", e),
+                )
+            })?,
+        Err(e) => {
+            // If error contains "No files found", return empty results
+            if e.to_string().contains("No files found") {
+                Vec::new()
+            } else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Query error: {}", e),
+                ));
+            }
+        }
+    };
 
     let total = results.len();
     let query_time_ms = start_time.elapsed().as_millis();
@@ -1014,9 +1022,25 @@ fn url_encode(s: &str) -> String {
     result
 }
 
+/// Create router for testing
+#[cfg(test)]
+fn create_test_app(data_dir: &str) -> Router {
+    let state = Arc::new(AppState::new(data_dir).expect("Failed to create test app state"));
+    Router::new()
+        .route("/", get(search_ui))
+        .route("/api/search", get(api_search))
+        .route("/api/filters", get(api_filters))
+        .route("/health", get(health))
+        .with_state(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as AxumStatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     #[test]
     fn test_parse_relative_time() {
@@ -1070,5 +1094,159 @@ mod tests {
         assert_eq!(priority_label(3), "Error");
         assert_eq!(priority_label(6), "Info");
         assert_eq!(priority_label(7), "Debug");
+    }
+
+    // API Tests
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_api_search_empty_results() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search?start=-1h&end=now")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_response: SearchResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(search_response.total, 0);
+        assert!(search_response.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_api_search_with_query_param() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search?q=error&start=-1h&end=now&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_response: SearchResponse = serde_json::from_slice(&body).unwrap();
+        // Empty dir should have no results
+        assert_eq!(search_response.total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_api_filters_endpoint() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/filters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filters: FilterValues = serde_json::from_slice(&body).unwrap();
+        // Empty dir should have empty filter lists
+        assert!(filters.hostnames.is_empty());
+        assert!(filters.units.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_ui_returns_html() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("Livedata"));
+    }
+
+    #[tokio::test]
+    async fn test_api_search_with_priority_filter() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search?start=-1h&end=now&priority=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_search_response_structure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = create_test_app(temp_dir.path().to_str().unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/search?start=-1h&end=now")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert!(json.get("results").is_some());
+        assert!(json.get("total").is_some());
+        assert!(json.get("query_time_ms").is_some());
     }
 }
