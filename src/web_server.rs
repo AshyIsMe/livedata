@@ -221,7 +221,7 @@ async fn api_search(
     // Build SQL query
     let parquet_glob = build_parquet_glob(&state.data_dir);
     let mut sql = format!(
-        "SELECT timestamp, _hostname, _systemd_unit, priority, _pid, _comm, message
+        "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
          FROM read_parquet('{}')
          WHERE timestamp >= '{}' AND timestamp < '{}'",
         parquet_glob,
@@ -391,7 +391,7 @@ async fn search_ui(
     let parquet_glob = build_parquet_glob(&state.data_dir);
 
     let mut sql = format!(
-        "SELECT timestamp, _hostname, _systemd_unit, priority, _pid, _comm, message
+        "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
          FROM read_parquet('{}')
          WHERE timestamp >= '{}' AND timestamp < '{}'",
         parquet_glob,
@@ -438,7 +438,7 @@ async fn search_ui(
 
     // Count total results (for pagination info)
     let count_sql = sql.replace(
-        "SELECT timestamp, _hostname, _systemd_unit, priority, _pid, _comm, message",
+        "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message",
         "SELECT COUNT(*)",
     );
 
