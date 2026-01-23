@@ -56,6 +56,12 @@ pub struct SearchParams {
     /// Pagination offset
     #[serde(default)]
     pub offset: usize,
+    /// Sort column (timestamp, hostname, unit, priority, comm)
+    #[serde(default = "default_sort")]
+    pub sort: String,
+    /// Sort direction (asc or desc)
+    #[serde(default = "default_sort_dir")]
+    pub sort_dir: String,
 }
 
 fn default_start() -> String {
@@ -68,6 +74,14 @@ fn default_end() -> String {
 
 fn default_limit() -> usize {
     100
+}
+
+fn default_sort() -> String {
+    "timestamp".to_string()
+}
+
+fn default_sort_dir() -> String {
+    "desc".to_string()
 }
 
 /// Search result entry
@@ -276,10 +290,26 @@ async fn api_search(
         sql.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
     }
 
+    // Validate and build ORDER BY clause
+    let sort_column = match params.sort.to_lowercase().as_str() {
+        "timestamp" => "timestamp",
+        "hostname" | "host" => "_hostname",
+        "unit" => "_systemd_unit",
+        "priority" | "pri" => "priority",
+        "comm" => "_comm",
+        _ => "timestamp", // Default to timestamp for invalid values
+    };
+
+    let sort_direction = match params.sort_dir.to_lowercase().as_str() {
+        "asc" => "ASC",
+        "desc" => "DESC",
+        _ => "DESC", // Default to DESC for invalid values
+    };
+
     // Add ordering and pagination
     sql.push_str(&format!(
-        " ORDER BY timestamp DESC LIMIT {} OFFSET {}",
-        limit, params.offset
+        " ORDER BY {} {} LIMIT {} OFFSET {}",
+        sort_column, sort_direction, limit, params.offset
     ));
 
     // Execute query
@@ -605,7 +635,7 @@ fn build_search_html(
         if current_page > 1 {
             let prev_offset = (current_page - 2) * limit;
             links.push(format!(
-                r#"<a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset={}" class="page-link">&laquo; Prev</a>"#,
+                r#"<a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset={}&sort={}&sort_dir={}" class="page-link">&laquo; Prev</a>"#,
                 url_encode(query_value),
                 url_encode(&params.start),
                 url_encode(&params.end),
@@ -613,7 +643,9 @@ fn build_search_html(
                 url_encode(unit_value),
                 priority_value.map(|p| format!("&priority={}", p)).unwrap_or_default(),
                 limit,
-                prev_offset
+                prev_offset,
+                url_encode(&params.sort),
+                url_encode(&params.sort_dir),
             ));
         }
 
@@ -627,7 +659,7 @@ fn build_search_html(
         if current_page < total_pages {
             let next_offset = current_page * limit;
             links.push(format!(
-                r#"<a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset={}" class="page-link">Next &raquo;</a>"#,
+                r#"<a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset={}&sort={}&sort_dir={}" class="page-link">Next &raquo;</a>"#,
                 url_encode(query_value),
                 url_encode(&params.start),
                 url_encode(&params.end),
@@ -635,7 +667,9 @@ fn build_search_html(
                 url_encode(unit_value),
                 priority_value.map(|p| format!("&priority={}", p)).unwrap_or_default(),
                 limit,
-                next_offset
+                next_offset,
+                url_encode(&params.sort),
+                url_encode(&params.sort_dir),
             ));
         }
 
@@ -646,6 +680,59 @@ fn build_search_html(
             total_count
         )
     };
+
+    // Build sortable table headers
+    let build_header = |column: &str, label: &str| -> String {
+        let (new_sort, new_dir) = if params.sort == column {
+            // Same column - toggle direction
+            let new_dir = if params.sort_dir == "asc" {
+                "desc"
+            } else {
+                "asc"
+            };
+            (column, new_dir)
+        } else {
+            // Different column - default to desc for timestamp, asc for others
+            let default_dir = if column == "timestamp" { "desc" } else { "asc" };
+            (column, default_dir)
+        };
+
+        let arrow = if params.sort == column {
+            if params.sort_dir == "asc" {
+                " ▲"
+            } else {
+                " ▼"
+            }
+        } else {
+            ""
+        };
+
+        format!(
+            r#"<th><a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset=0&sort={}&sort_dir={}">{}{}</a></th>"#,
+            url_encode(query_value),
+            url_encode(&params.start),
+            url_encode(&params.end),
+            url_encode(hostname_value),
+            url_encode(unit_value),
+            priority_value
+                .map(|p| format!("&priority={}", p))
+                .unwrap_or_default(),
+            limit,
+            new_sort,
+            new_dir,
+            label,
+            arrow
+        )
+    };
+
+    let table_headers = format!(
+        "{}\n{}\n{}\n{}\n{}\n<th>Message</th>",
+        build_header("timestamp", "Timestamp"),
+        build_header("hostname", "Host"),
+        build_header("unit", "Unit"),
+        build_header("priority", "Pri"),
+        build_header("comm", "Comm"),
+    );
 
     format!(
         r##"<!DOCTYPE html>
@@ -776,6 +863,17 @@ fn build_search_html(
             border-bottom: 2px solid #0f3460;
             position: sticky;
             top: 0;
+        }}
+        .results-table th a {{
+            color: #00d9ff;
+            text-decoration: none;
+            display: inline-block;
+            cursor: pointer;
+            user-select: none;
+        }}
+        .results-table th a:hover {{
+            color: #fff;
+            text-decoration: underline;
         }}
         .results-table td {{
             padding: 10px;
@@ -936,12 +1034,7 @@ fn build_search_html(
         <table class="results-table">
             <thead>
                 <tr>
-                    <th>Timestamp</th>
-                    <th>Host</th>
-                    <th>Unit</th>
-                    <th>Pri</th>
-                    <th>Comm</th>
-                    <th>Message</th>
+                    {}
                 </tr>
             </thead>
             <tbody>
@@ -983,6 +1076,7 @@ fn build_search_html(
         } else {
             "".to_string()
         },
+        table_headers,
         result_rows,
         pagination,
     )
