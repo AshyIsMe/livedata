@@ -5,19 +5,32 @@ use duckdb::{Connection, params};
 use log::{debug, info};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub struct DuckDBBuffer {
     pub conn: Connection,
+    db_path: PathBuf,
 }
 
 impl DuckDBBuffer {
-    pub fn new() -> Result<Self> {
-        info!("Initializing DuckDB in-memory buffer");
-        let conn = Connection::open_in_memory()?;
+    pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
+        let data_dir = data_dir.as_ref();
 
-        // Create the main table for journal logs with all systemd journal fields
+        // Ensure data directory exists
+        fs::create_dir_all(data_dir)?;
+
+        let db_path = data_dir.join("livedata.duckdb");
+        info!(
+            "Initializing DuckDB on-disk database at: {}",
+            db_path.display()
+        );
+
+        let conn = Connection::open(&db_path)?;
+
+        // Create the main table for journal logs with all systemd journal fields (if not exists)
         conn.execute(
-            "CREATE TABLE journal_logs (
+            "CREATE TABLE IF NOT EXISTS journal_logs (
                 timestamp TIMESTAMP NOT NULL,
                 minute_key VARCHAR NOT NULL,
                 -- User journal fields
@@ -104,22 +117,39 @@ impl DuckDBBuffer {
             [],
         )?;
 
-        // Create indexes for efficient querying
+        // Create indexes for efficient querying (if not exist)
         conn.execute(
-            "CREATE INDEX idx_minute_key ON journal_logs(minute_key)",
+            "CREATE INDEX IF NOT EXISTS idx_minute_key ON journal_logs(minute_key)",
             [],
         )?;
-        conn.execute("CREATE INDEX idx_timestamp ON journal_logs(timestamp)", [])?;
-        conn.execute("CREATE INDEX idx_priority ON journal_logs(priority)", [])?;
-        conn.execute("CREATE INDEX idx_hostname ON journal_logs(_HOSTNAME)", [])?;
         conn.execute(
-            "CREATE INDEX idx_systemd_unit ON journal_logs(_SYSTEMD_UNIT)",
+            "CREATE INDEX IF NOT EXISTS idx_timestamp ON journal_logs(timestamp)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_priority ON journal_logs(priority)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hostname ON journal_logs(_HOSTNAME)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_systemd_unit ON journal_logs(_SYSTEMD_UNIT)",
             [],
         )?;
 
-        info!("DuckDB buffer initialized successfully");
+        info!(
+            "DuckDB database initialized successfully at: {}",
+            db_path.display()
+        );
 
-        Ok(Self { conn })
+        Ok(Self { conn, db_path })
+    }
+
+    /// Get the path to the database file
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     pub fn add_entry(&mut self, entry: &LogEntry) -> Result<()> {
@@ -775,10 +805,12 @@ pub struct BufferStats {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use tempfile::TempDir;
 
     #[test]
     fn test_duckdb_buffer_creation() {
-        let result = DuckDBBuffer::new();
+        let temp_dir = TempDir::new().unwrap();
+        let result = DuckDBBuffer::new(temp_dir.path());
         if let Err(e) = &result {
             eprintln!("DuckDB buffer creation error: {:?}", e);
         }
@@ -787,7 +819,8 @@ mod tests {
 
     #[test]
     fn test_add_and_retrieve_entry() {
-        let mut buffer = DuckDBBuffer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
@@ -839,7 +872,8 @@ mod tests {
 
     #[test]
     fn test_buffer_stats() {
-        let mut buffer = DuckDBBuffer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
@@ -857,7 +891,8 @@ mod tests {
 
     #[test]
     fn test_delete_minute() {
-        let mut buffer = DuckDBBuffer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
@@ -878,7 +913,8 @@ mod tests {
 
     #[test]
     fn test_field_extraction_type_conversions() {
-        let mut buffer = DuckDBBuffer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
@@ -911,7 +947,8 @@ mod tests {
 
     #[test]
     fn test_extra_fields_preservation() {
-        let mut buffer = DuckDBBuffer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
 
         let mut fields = std::collections::HashMap::new();
         fields.insert("MESSAGE".to_string(), "Test message".to_string());
@@ -944,7 +981,8 @@ mod tests {
 
     #[test]
     fn test_nullable_fields_handling() {
-        let mut buffer = DuckDBBuffer::new().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
 
         let mut fields = std::collections::HashMap::new();
         // Only include MESSAGE, other fields should be NULL

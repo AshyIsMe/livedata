@@ -1,9 +1,9 @@
 use crate::duckdb_buffer::DuckDBBuffer;
 use crate::journal_reader::JournalLogReader;
 use crate::log_entry::LogEntry;
-use crate::parquet_writer::ParquetWriter;
 use anyhow::Result;
 use chrono::{TimeDelta, Utc};
+use gethostname::gethostname;
 use log::{error, info, warn};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
@@ -15,7 +15,7 @@ use std::time::Duration;
 pub struct ApplicationController {
     journal_reader: JournalLogReader,
     buffer: DuckDBBuffer,
-    parquet_writer: ParquetWriter,
+    hostname: String,
     shutdown_signal: Arc<AtomicBool>,
 }
 
@@ -24,16 +24,17 @@ impl ApplicationController {
         info!("Initializing Application Controller");
 
         let journal_reader = JournalLogReader::new()?;
-        let buffer = DuckDBBuffer::new()?;
-        let parquet_writer = ParquetWriter::new(data_dir)?;
+        let buffer = DuckDBBuffer::new(data_dir)?;
+        let hostname = gethostname().to_str().unwrap_or("unknown").to_string();
         let shutdown_signal = Arc::new(AtomicBool::new(false));
 
         info!("Application Controller initialized successfully");
+        info!("Using on-disk DuckDB at: {}", buffer.db_path().display());
 
         Ok(Self {
             journal_reader,
             buffer,
-            parquet_writer,
+            hostname,
             shutdown_signal,
         })
     }
@@ -58,7 +59,7 @@ impl ApplicationController {
     }
 
     pub fn run(&mut self, follow: bool) -> Result<()> {
-        info!("Starting journald to parquet log collection");
+        info!("Starting journald log collection to DuckDB");
 
         self.setup_signal_handler()?;
 
@@ -73,8 +74,8 @@ impl ApplicationController {
             info!("Follow mode: starting real-time monitoring from now");
         }
 
-        let mut last_flush_time = Utc::now();
-        let flush_interval = TimeDelta::seconds(30); // Check for completed minutes every 30 seconds
+        let mut last_status_time = Utc::now();
+        let status_interval = TimeDelta::seconds(30); // Log status every 30 seconds
 
         info!("Starting main loop");
 
@@ -98,23 +99,18 @@ impl ApplicationController {
                 }
             }
 
-            // Check if it's time to flush completed minutes
+            // Log status periodically
             let current_time = Utc::now();
-            if current_time - last_flush_time >= flush_interval {
-                if let Err(e) = self.flush_completed_minutes(current_time) {
-                    error!("Failed to flush completed minutes: {}", e);
-                }
-                last_flush_time = current_time;
-
-                // Log status periodically
+            if current_time - last_status_time >= status_interval {
                 self.log_status();
+                last_status_time = current_time;
             }
 
             // Small sleep to prevent busy waiting
             thread::sleep(Duration::from_millis(100));
         }
 
-        // Graceful shutdown - flush all remaining data
+        // Graceful shutdown
         self.graceful_shutdown()
     }
 
@@ -128,39 +124,14 @@ impl ApplicationController {
         let processed_count =
             self.journal_reader
                 .process_historical_entries(cutoff_time, |entry| {
-                    // Add entry to buffer
+                    // Add entry to buffer (now persisted to on-disk DuckDB)
                     self.buffer.add_entry(entry)
                 })?;
 
         info!(
-            "Processed {} historical entries from the last hour",
+            "Processed {} historical entries from the last hour (stored in DuckDB)",
             processed_count
         );
-
-        // Immediately flush all the historical data to parquet
-        if processed_count > 0 {
-            info!("Flushing historical data to parquet files");
-            let current_time = Utc::now();
-
-            // Flush all completed minutes from historical data
-            let results = self
-                .parquet_writer
-                .write_completed_minutes(&mut self.buffer, current_time)?;
-
-            if !results.is_empty() {
-                let total_entries: i64 = results.iter().map(|r| r.entries_written).sum();
-                let total_bytes: u64 = results.iter().map(|r| r.bytes_written).sum();
-
-                info!(
-                    "Historical data flushed: {} minutes, {} entries ({} bytes)",
-                    results.len(),
-                    total_entries,
-                    total_bytes
-                );
-            }
-        } else {
-            info!("No historical entries found in the last hour");
-        }
 
         // Now seek to tail for real-time monitoring
         self.journal_reader.seek_to_tail()?;
@@ -173,60 +144,13 @@ impl ApplicationController {
     }
 
     fn process_log_entry(&mut self, entry: LogEntry) -> Result<()> {
-        // Add entry to buffer
+        // Add entry to on-disk DuckDB
         self.buffer.add_entry(&entry)?;
-
-        // Log processing stats (using a field counter for now)
-        // In a real implementation, we'd track this more carefully
-        info!("Processing log entry (timestamp: {})", entry.timestamp);
-
-        Ok(())
-    }
-
-    fn flush_completed_minutes(&mut self, current_time: chrono::DateTime<Utc>) -> Result<()> {
-        let results = self
-            .parquet_writer
-            .write_completed_minutes(&mut self.buffer, current_time)?;
-
-        if !results.is_empty() {
-            let total_entries: i64 = results.iter().map(|r| r.entries_written).sum();
-            let total_bytes: u64 = results.iter().map(|r| r.bytes_written).sum();
-
-            info!(
-                "Flushed {} completed minutes: {} entries ({} bytes)",
-                results.len(),
-                total_entries,
-                total_bytes
-            );
-        }
-
         Ok(())
     }
 
     fn graceful_shutdown(&mut self) -> Result<()> {
         info!("Starting graceful shutdown");
-
-        // Flush all remaining minutes
-        match self.parquet_writer.flush_all_minutes(&mut self.buffer) {
-            Ok(results) => {
-                if !results.is_empty() {
-                    let total_entries: i64 = results.iter().map(|r| r.entries_written).sum();
-                    let total_bytes: u64 = results.iter().map(|r| r.bytes_written).sum();
-
-                    info!(
-                        "Final flush: {} minutes, {} entries ({} bytes)",
-                        results.len(),
-                        total_entries,
-                        total_bytes
-                    );
-                } else {
-                    info!("No remaining data to flush");
-                }
-            }
-            Err(e) => {
-                error!("Failed to flush remaining data: {}", e);
-            }
-        }
 
         // Log final statistics
         self.log_final_statistics();
@@ -238,99 +162,66 @@ impl ApplicationController {
     fn log_status(&mut self) {
         match self.buffer.get_buffer_stats() {
             Ok(stats) => {
-                if stats.total_entries > 0 {
-                    info!(
-                        "Status: {} entries in buffer, {} minutes buffered",
-                        stats.total_entries, stats.buffered_minutes_count
-                    );
+                info!(
+                    "Status: {} total entries in DuckDB, {} distinct minutes",
+                    stats.total_entries, stats.buffered_minutes_count
+                );
 
-                    if let (Some(oldest), Some(newest)) =
-                        (&stats.oldest_minute, &stats.newest_minute)
-                    {
-                        info!("Buffer range: {} to {}", oldest, newest);
-                    }
+                if let (Some(oldest), Some(newest)) = (&stats.oldest_minute, &stats.newest_minute) {
+                    info!("Data range: {} to {}", oldest, newest);
                 }
             }
             Err(e) => {
-                warn!("Failed to get buffer status: {}", e);
+                warn!("Failed to get database status: {}", e);
             }
         }
 
-        // Log parquet writer statistics
-        match self.parquet_writer.get_file_count() {
-            Ok(file_count) => {
-                if file_count > 0 {
-                    match self.parquet_writer.get_disk_usage() {
-                        Ok(bytes) => {
-                            info!(
-                                "Parquet files: {} files, {} MB",
-                                file_count,
-                                bytes / (1024 * 1024)
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Failed to get disk usage: {}", e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to get file count: {}", e);
-            }
+        // Log database file size
+        if let Ok(metadata) = std::fs::metadata(self.buffer.db_path()) {
+            let size_mb = metadata.len() / (1024 * 1024);
+            info!("Database size: {} MB", size_mb);
         }
     }
 
     fn log_final_statistics(&mut self) {
         info!("=== Final Statistics ===");
 
-        // Buffer statistics
+        // Database statistics
         match self.buffer.get_buffer_stats() {
             Ok(stats) => {
                 info!(
-                    "Final buffer: {} entries, {} minutes buffered",
+                    "Total entries in DuckDB: {}, distinct minutes: {}",
                     stats.total_entries, stats.buffered_minutes_count
                 );
             }
             Err(e) => {
-                warn!("Failed to get final buffer stats: {}", e);
+                warn!("Failed to get final database stats: {}", e);
             }
         }
 
-        // Parquet writer statistics
-        match self.parquet_writer.get_file_count() {
-            Ok(file_count) => match self.parquet_writer.get_disk_usage() {
-                Ok(bytes) => {
-                    info!(
-                        "Final parquet output: {} files, {} MB",
-                        file_count,
-                        bytes / (1024 * 1024)
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to get final disk usage: {}", e);
-                }
-            },
-            Err(e) => {
-                warn!("Failed to get final file count: {}", e);
-            }
+        // Database file size
+        if let Ok(metadata) = std::fs::metadata(self.buffer.db_path()) {
+            let size_mb = metadata.len() / (1024 * 1024);
+            info!("Final database size: {} MB", size_mb);
         }
 
+        info!("Database path: {}", self.buffer.db_path().display());
         info!("=== End Statistics ===");
     }
 
     pub fn get_status(&mut self) -> Result<ApplicationStatus> {
         let buffer_stats = self.buffer.get_buffer_stats()?;
-        let file_count = self.parquet_writer.get_file_count()?;
-        let disk_usage = self.parquet_writer.get_disk_usage()?;
+        let db_size = std::fs::metadata(self.buffer.db_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         Ok(ApplicationStatus {
-            hostname: self.parquet_writer.get_hostname().to_string(),
-            total_buffered_entries: buffer_stats.total_entries,
-            buffered_minutes_count: buffer_stats.buffered_minutes_count,
-            oldest_buffered_minute: buffer_stats.oldest_minute,
-            newest_buffered_minute: buffer_stats.newest_minute,
-            parquet_file_count: file_count,
-            total_disk_usage_bytes: disk_usage,
+            hostname: self.hostname.clone(),
+            total_entries: buffer_stats.total_entries,
+            distinct_minutes_count: buffer_stats.buffered_minutes_count,
+            oldest_entry_minute: buffer_stats.oldest_minute,
+            newest_entry_minute: buffer_stats.newest_minute,
+            database_size_bytes: db_size,
         })
     }
 }
@@ -338,12 +229,11 @@ impl ApplicationController {
 #[derive(Debug)]
 pub struct ApplicationStatus {
     pub hostname: String,
-    pub total_buffered_entries: i64,
-    pub buffered_minutes_count: usize,
-    pub oldest_buffered_minute: Option<chrono::DateTime<Utc>>,
-    pub newest_buffered_minute: Option<chrono::DateTime<Utc>>,
-    pub parquet_file_count: usize,
-    pub total_disk_usage_bytes: u64,
+    pub total_entries: i64,
+    pub distinct_minutes_count: usize,
+    pub oldest_entry_minute: Option<chrono::DateTime<Utc>>,
+    pub newest_entry_minute: Option<chrono::DateTime<Utc>>,
+    pub database_size_bytes: u64,
 }
 
 #[cfg(test)]
@@ -364,9 +254,8 @@ mod tests {
         let mut controller = ApplicationController::new(temp_dir.path()).unwrap();
 
         let status = controller.get_status().unwrap();
-        assert_eq!(status.total_buffered_entries, 0);
-        assert_eq!(status.buffered_minutes_count, 0);
-        assert_eq!(status.parquet_file_count, 0);
+        assert_eq!(status.total_entries, 0);
+        assert_eq!(status.distinct_minutes_count, 0);
         assert!(!status.hostname.is_empty());
     }
 }

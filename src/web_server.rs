@@ -18,7 +18,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(data_dir: &str) -> Result<Self, duckdb::Error> {
-        let conn = Connection::open_in_memory()?;
+        // Connect to the on-disk DuckDB database
+        let db_path = std::path::Path::new(data_dir).join("livedata.duckdb");
+        let conn = Connection::open(&db_path)?;
         Ok(Self {
             data_dir: data_dir.to_string(),
             conn: Mutex::new(conn),
@@ -173,11 +175,6 @@ fn priority_label(p: u8) -> &'static str {
     }
 }
 
-/// Build the parquet glob pattern
-fn build_parquet_glob(data_dir: &str) -> String {
-    format!("{}/**/*.parquet", data_dir)
-}
-
 pub async fn run_web_server(data_dir: &str) {
     let state = Arc::new(AppState::new(data_dir).expect("Failed to create application state"));
 
@@ -218,13 +215,11 @@ async fn api_search(
     // Validate and clamp limit
     let limit = params.limit.min(10000);
 
-    // Build SQL query
-    let parquet_glob = build_parquet_glob(&state.data_dir);
+    // Build SQL query against the journal_logs table
     let mut sql = format!(
         "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
-         FROM read_parquet('{}')
+         FROM journal_logs
          WHERE timestamp >= '{}' AND timestamp < '{}'",
-        parquet_glob,
         start.to_rfc3339(),
         end.to_rfc3339()
     );
@@ -303,8 +298,9 @@ async fn api_search(
                 )
             })?,
         Err(e) => {
-            // If error contains "No files found", return empty results
-            if e.to_string().contains("No files found") {
+            // If table doesn't exist yet (no data collected), return empty results
+            let err_str = e.to_string();
+            if err_str.contains("does not exist") || err_str.contains("journal_logs") {
                 Vec::new()
             } else {
                 return Err((
@@ -331,16 +327,11 @@ async fn api_search(
 async fn api_filters(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FilterValues>, (StatusCode, String)> {
-    let parquet_glob = build_parquet_glob(&state.data_dir);
     let conn = state.conn.lock().unwrap();
 
     // Get distinct hostnames
-    let hostnames_sql = format!(
-        "SELECT DISTINCT _hostname FROM read_parquet('{}') WHERE _hostname IS NOT NULL ORDER BY _hostname",
-        parquet_glob
-    );
     let hostnames: Vec<String> = conn
-        .prepare(&hostnames_sql)
+        .prepare("SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -348,12 +339,8 @@ async fn api_filters(
         .unwrap_or_default();
 
     // Get distinct units
-    let units_sql = format!(
-        "SELECT DISTINCT _systemd_unit FROM read_parquet('{}') WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit",
-        parquet_glob
-    );
     let units: Vec<String> = conn
-        .prepare(&units_sql)
+        .prepare("SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -388,13 +375,11 @@ async fn search_ui(
 
     // Execute search query
     let limit = params.limit.min(10000);
-    let parquet_glob = build_parquet_glob(&state.data_dir);
 
     let mut sql = format!(
         "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
-         FROM read_parquet('{}')
+         FROM journal_logs
          WHERE timestamp >= '{}' AND timestamp < '{}'",
-        parquet_glob,
         start.to_rfc3339(),
         end.to_rfc3339()
     );
@@ -476,24 +461,16 @@ async fn search_ui(
         .unwrap_or_default();
 
     // Get filter options
-    let hostnames_sql = format!(
-        "SELECT DISTINCT _hostname FROM read_parquet('{}') WHERE _hostname IS NOT NULL ORDER BY _hostname",
-        parquet_glob
-    );
     let hostnames: Vec<String> = conn
-        .prepare(&hostnames_sql)
+        .prepare("SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
 
-    let units_sql = format!(
-        "SELECT DISTINCT _systemd_unit FROM read_parquet('{}') WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit",
-        parquet_glob
-    );
     let units: Vec<String> = conn
-        .prepare(&units_sql)
+        .prepare("SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())

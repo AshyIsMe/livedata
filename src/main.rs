@@ -5,11 +5,11 @@ use livedata::web_server::run_web_server;
 use log::info;
 use std::thread;
 
-/// livedata - Journald to parquet log collector
+/// livedata - Journald log collector with DuckDB storage
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Data directory for storing parquet files
+    /// Data directory for storing DuckDB database
     #[arg(short, long, default_value = "./data")]
     data_dir: String,
 
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    info!("Starting journald to parquet log collector");
+    info!("Starting journald log collector with DuckDB storage");
 
     // Parse command line arguments
     let args = Args::parse();
