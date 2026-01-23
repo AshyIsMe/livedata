@@ -39,6 +39,10 @@ impl ApplicationController {
         })
     }
 
+    pub fn get_shutdown_signal(&self) -> Arc<AtomicBool> {
+        self.shutdown_signal.clone()
+    }
+
     pub fn setup_signal_handler(&self) -> Result<()> {
         let shutdown_signal = self.shutdown_signal.clone();
         thread::spawn(move || {

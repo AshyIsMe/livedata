@@ -8,6 +8,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Application state shared across handlers
@@ -175,7 +176,7 @@ fn priority_label(p: u8) -> &'static str {
     }
 }
 
-pub async fn run_web_server(data_dir: &str) {
+pub async fn run_web_server(data_dir: &str, shutdown_signal: Arc<AtomicBool>) {
     let state = Arc::new(AppState::new(data_dir).expect("Failed to create application state"));
 
     let app = Router::new()
@@ -189,7 +190,21 @@ pub async fn run_web_server(data_dir: &str) {
         .await
         .unwrap();
     println!("Web server listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+
+    // Run axum server with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // Poll the shutdown signal
+            loop {
+                if shutdown_signal.load(Ordering::Relaxed) {
+                    log::info!("Web server received shutdown signal");
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
 }
 
 /// Health check endpoint
