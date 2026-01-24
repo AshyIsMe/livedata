@@ -472,10 +472,26 @@ async fn search_ui(
         "SELECT COUNT(*)",
     );
 
+    // Validate and build ORDER BY clause
+    let sort_column = match params.sort.to_lowercase().as_str() {
+        "timestamp" => "timestamp",
+        "hostname" | "host" => "_hostname",
+        "unit" => "_systemd_unit",
+        "priority" | "pri" => "priority",
+        "comm" => "_comm",
+        _ => "timestamp", // Default to timestamp for invalid values
+    };
+
+    let sort_direction = match params.sort_dir.to_lowercase().as_str() {
+        "asc" => "ASC",
+        "desc" => "DESC",
+        _ => "DESC", // Default to DESC for invalid values
+    };
+
     // Add ordering and pagination
     sql.push_str(&format!(
-        " ORDER BY timestamp DESC LIMIT {} OFFSET {}",
-        limit, params.offset
+        " ORDER BY {} {} LIMIT {} OFFSET {}",
+        sort_column, sort_direction, limit, params.offset
     ));
 
     let conn = state.conn.lock().unwrap();
