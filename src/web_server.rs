@@ -666,20 +666,22 @@ fn build_search_html(
     };
 
     // Serialize results as JSON for Perspective
-    let results_json = serde_json::to_string(&results
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "timestamp": r.timestamp,
-                "hostname": r.hostname.as_deref().unwrap_or("-"),
-                "unit": r.unit.as_deref().unwrap_or("-"),
-                "priority": r.priority.unwrap_or(-1),
-                "comm": r.comm.as_deref().unwrap_or("-"),
-                "message": r.message.as_deref().unwrap_or("-"),
+    let results_json = serde_json::to_string(
+        &results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "timestamp": r.timestamp,
+                    "hostname": r.hostname.as_deref().unwrap_or("-"),
+                    "unit": r.unit.as_deref().unwrap_or("-"),
+                    "priority": r.priority.unwrap_or(-1),
+                    "comm": r.comm.as_deref().unwrap_or("-"),
+                    "message": r.message.as_deref().unwrap_or("-"),
+                })
             })
-        })
-        .collect::<Vec<_>>()
-    ).unwrap_or_else(|_| "[]".to_string());
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
 
     format!(
         r##"<!DOCTYPE html>
@@ -1051,8 +1053,8 @@ fn build_search_html(
         } else {
             "".to_string()
         },
-        results_json,
         pagination,
+        results_json,
     )
 }
 
