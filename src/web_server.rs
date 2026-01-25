@@ -8,6 +8,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -605,39 +606,6 @@ fn build_search_html(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Build results table rows
-    let result_rows: String = results
-        .iter()
-        .map(|r| {
-            let priority_class = match r.priority {
-                Some(0..=2) => "priority-critical",
-                Some(3) => "priority-error",
-                Some(4) => "priority-warning",
-                _ => "",
-            };
-            format!(
-                r#"<tr class="{}">
-                    <td class="timestamp">{}</td>
-                    <td>{}</td>
-                    <td>{}</td>
-                    <td class="priority">{}</td>
-                    <td>{}</td>
-                    <td class="message">{}</td>
-                </tr>"#,
-                priority_class,
-                html_escape(&r.timestamp),
-                html_escape(r.hostname.as_deref().unwrap_or("-")),
-                html_escape(r.unit.as_deref().unwrap_or("-")),
-                r.priority
-                    .map(|p| format!("{}", p))
-                    .unwrap_or("-".to_string()),
-                html_escape(r.comm.as_deref().unwrap_or("-")),
-                html_escape(r.message.as_deref().unwrap_or("-")),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
     // Calculate pagination
     let limit = params.limit.min(10000);
     let current_page = params.offset / limit + 1;
@@ -697,58 +665,21 @@ fn build_search_html(
         )
     };
 
-    // Build sortable table headers
-    let build_header = |column: &str, label: &str| -> String {
-        let (new_sort, new_dir) = if params.sort == column {
-            // Same column - toggle direction
-            let new_dir = if params.sort_dir == "asc" {
-                "desc"
-            } else {
-                "asc"
-            };
-            (column, new_dir)
-        } else {
-            // Different column - default to desc for timestamp, asc for others
-            let default_dir = if column == "timestamp" { "desc" } else { "asc" };
-            (column, default_dir)
-        };
-
-        let arrow = if params.sort == column {
-            if params.sort_dir == "asc" {
-                " ▲"
-            } else {
-                " ▼"
-            }
-        } else {
-            ""
-        };
-
-        format!(
-            r#"<th><a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset=0&sort={}&sort_dir={}">{}{}</a></th>"#,
-            url_encode(query_value),
-            url_encode(&params.start),
-            url_encode(&params.end),
-            url_encode(hostname_value),
-            url_encode(unit_value),
-            priority_value
-                .map(|p| format!("&priority={}", p))
-                .unwrap_or_default(),
-            limit,
-            new_sort,
-            new_dir,
-            label,
-            arrow
-        )
-    };
-
-    let table_headers = format!(
-        "{}\n{}\n{}\n{}\n{}\n<th>Message</th>",
-        build_header("timestamp", "Timestamp"),
-        build_header("hostname", "Host"),
-        build_header("unit", "Unit"),
-        build_header("priority", "Pri"),
-        build_header("comm", "Comm"),
-    );
+    // Serialize results as JSON for Perspective
+    let results_json = serde_json::to_string(&results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "timestamp": r.timestamp,
+                "hostname": r.hostname.as_deref().unwrap_or("-"),
+                "unit": r.unit.as_deref().unwrap_or("-"),
+                "priority": r.priority.unwrap_or(-1),
+                "comm": r.comm.as_deref().unwrap_or("-"),
+                "message": r.message.as_deref().unwrap_or("-"),
+            })
+        })
+        .collect::<Vec<_>>()
+    ).unwrap_or_else(|_| "[]".to_string());
 
     format!(
         r##"<!DOCTYPE html>
@@ -757,6 +688,11 @@ fn build_search_html(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective@3.0.1/dist/cdn/perspective.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@3.0.1/dist/cdn/perspective-viewer.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid@3.0.1/dist/cdn/perspective-viewer-datagrid.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc@3.0.1/dist/cdn/perspective-viewer-d3fc.js"></script>
+    <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@3.0.1/dist/css/themes.css" />
     <style>
         * {{
             box-sizing: border-box;
@@ -981,6 +917,19 @@ fn build_search_html(
                 flex-wrap: wrap;
             }}
         }}
+        perspective-viewer {{
+            height: 600px;
+            width: 100%;
+            display: block;
+            border-radius: 8px;
+            overflow: hidden;
+        }}
+        .perspective-container {{
+            background-color: #16213e;
+            padding: 0;
+            border-radius: 8px;
+            overflow: hidden;
+        }}
     </style>
 </head>
 <body>
@@ -1047,21 +996,14 @@ fn build_search_html(
 
         {}
 
-        <table class="results-table">
-            <thead>
-                <tr>
-                    {}
-                </tr>
-            </thead>
-            <tbody>
-                {}
-            </tbody>
-        </table>
+        <div class="perspective-container">
+            <perspective-viewer id="perspective-viewer" theme="Pro Dark"></perspective-viewer>
+        </div>
 
         {}
     </div>
 
-    <script>
+    <script type="module">
         // Focus search on / key
         document.addEventListener('keydown', function(e) {{
             if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
@@ -1076,6 +1018,23 @@ fn build_search_html(
             document.getElementById('end').value = end;
             document.querySelector('form').submit();
         }}
+
+        // Initialize Perspective
+        window.addEventListener('DOMContentLoaded', async function() {{
+            const viewer = document.getElementById('perspective-viewer');
+            const data = {};
+
+            if (data && data.length > 0) {{
+                await viewer.load(data);
+                await viewer.restore({{
+                    plugin: 'Datagrid',
+                    columns: ['timestamp', 'hostname', 'unit', 'priority', 'comm', 'message'],
+                    sort: [['timestamp', 'desc']],
+                    theme: 'Pro Dark'
+                }});
+            }}
+        }});
+        window.setTimeRange = setTimeRange;
     </script>
 </body>
 </html>"##,
@@ -1092,8 +1051,7 @@ fn build_search_html(
         } else {
             "".to_string()
         },
-        table_headers,
-        result_rows,
+        results_json,
         pagination,
     )
 }
