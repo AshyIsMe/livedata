@@ -666,6 +666,7 @@ fn build_search_html(
     };
 
     // Serialize results as JSON for Perspective
+    // Escape for safe embedding in HTML (prevent </script> and other HTML issues)
     let results_json = serde_json::to_string(
         &results
             .iter()
@@ -681,7 +682,8 @@ fn build_search_html(
             })
             .collect::<Vec<_>>(),
     )
-    .unwrap_or_else(|_| "[]".to_string());
+    .unwrap_or_else(|_| "[]".to_string())
+    .replace("</", "<\\/"); // Prevent closing script tag in JSON strings
 
     format!(
         r##"<!DOCTYPE html>
@@ -999,11 +1001,19 @@ fn build_search_html(
         {}
 
         <div class="perspective-container">
-            <perspective-viewer id="perspective-viewer" theme="Pro Dark"></perspective-viewer>
+            <perspective-viewer
+                id="perspective-viewer"
+                theme="Pro Dark"
+                plugin="Datagrid">
+            </perspective-viewer>
         </div>
 
         {}
     </div>
+
+    <script type="application/json" id="results-data">
+        {}
+    </script>
 
     <script type="module">
         // Focus search on / key
@@ -1023,17 +1033,24 @@ fn build_search_html(
 
         // Initialize Perspective
         window.addEventListener('DOMContentLoaded', async function() {{
-            const viewer = document.getElementById('perspective-viewer');
-            const data = {};
+            try {{
+                const viewer = document.getElementById('perspective-viewer');
+                const dataElement = document.getElementById('results-data');
+                let data = [];
 
-            if (data && data.length > 0) {{
+                if (dataElement && dataElement.textContent.trim()) {{
+                    data = JSON.parse(dataElement.textContent);
+                }}
+
+                console.log('Loading', data.length, 'rows into Perspective');
+
+                // Load data into the viewer
                 await viewer.load(data);
-                await viewer.restore({{
-                    plugin: 'Datagrid',
-                    columns: ['timestamp', 'hostname', 'unit', 'priority', 'comm', 'message'],
-                    sort: [['timestamp', 'desc']],
-                    theme: 'Pro Dark'
-                }});
+
+                // Configure the view
+                viewer.setAttribute('sort', JSON.stringify([['timestamp', 'desc']]));
+            }} catch (error) {{
+                console.error('Failed to initialize Perspective:', error);
             }}
         }});
         window.setTimeRange = setTimeRange;
