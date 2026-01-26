@@ -692,7 +692,11 @@ fn build_search_html(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
-    <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@perspective-dev/viewer/dist/css/themes.css" />
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective@2.10.1/dist/cdn/perspective.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@2.10.1/dist/cdn/perspective-viewer.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid@2.10.1/dist/cdn/perspective-viewer-datagrid.js"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc@2.10.1/dist/cdn/perspective-viewer-d3fc.js"></script>
+    <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@2.10.1/dist/css/themes.css" />
     <style>
         * {{
             box-sizing: border-box;
@@ -997,11 +1001,7 @@ fn build_search_html(
         {}
 
         <div class="perspective-container">
-            <perspective-viewer
-                id="perspective-viewer"
-                theme="Pro Dark"
-                plugin="Datagrid">
-            </perspective-viewer>
+            <perspective-viewer id="perspective-viewer"></perspective-viewer>
         </div>
 
         {}
@@ -1012,11 +1012,7 @@ fn build_search_html(
     </script>
 
     <script type="module">
-        // Import Perspective modules
-        import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer/dist/cdn/perspective-viewer.js";
-        import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-datagrid/dist/cdn/perspective-viewer-datagrid.js";
-        import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-d3fc/dist/cdn/perspective-viewer-d3fc.js";
-        import perspective from "https://cdn.jsdelivr.net/npm/@perspective-dev/client/dist/cdn/perspective.js";
+        import perspective from "https://cdn.jsdelivr.net/npm/@finos/perspective@2.10.1/dist/cdn/perspective.js";
 
         // Focus search on / key
         document.addEventListener('keydown', function(e) {{
@@ -1036,6 +1032,9 @@ fn build_search_html(
 
         // Initialize Perspective
         try {{
+            // Wait for custom element to be defined
+            await customElements.whenDefined('perspective-viewer');
+
             const viewer = document.getElementById('perspective-viewer');
             const dataElement = document.getElementById('results-data');
 
@@ -1058,18 +1057,10 @@ fn build_search_html(
                 if (data.length > 0) {{
                     // Create a Perspective worker and table
                     const worker = await perspective.worker();
-                    await worker.table(data, {{ name: "results" }});
+                    const table = await worker.table(data);
 
-                    // Load the worker into the viewer
-                    await viewer.load(worker);
-
-                    // Configure the viewer
-                    await viewer.restore({{
-                        table: "results",
-                        plugin: "Datagrid",
-                        theme: "Pro Dark",
-                        settings: false
-                    }});
+                    // Load the table into the viewer
+                    await viewer.load(table);
 
                     console.log('Perspective initialized successfully');
                 }}
