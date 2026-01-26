@@ -1062,6 +1062,11 @@ fn build_search_html(
                     // Load the table into the viewer
                     await viewer.load(table);
 
+                    // Set column order with timestamp first
+                    await viewer.restore({{
+                        columns: ["timestamp", "hostname", "unit", "priority", "comm", "message"]
+                    }});
+
                     console.log('Perspective initialized successfully');
                 }}
             }}
