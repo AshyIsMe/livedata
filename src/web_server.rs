@@ -692,11 +692,7 @@ fn build_search_html(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective@3.3.0/dist/cdn/perspective.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@3.3.0/dist/cdn/perspective-viewer.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid@3.3.0/dist/cdn/perspective-viewer-datagrid.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc@3.3.0/dist/cdn/perspective-viewer-d3fc.js"></script>
-    <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@3.3.0/dist/css/themes.css" />
+    <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@perspective-dev/viewer/dist/css/themes.css" />
     <style>
         * {{
             box-sizing: border-box;
@@ -1016,6 +1012,12 @@ fn build_search_html(
     </script>
 
     <script type="module">
+        // Import Perspective modules
+        import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer/dist/cdn/perspective-viewer.js";
+        import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-datagrid/dist/cdn/perspective-viewer-datagrid.js";
+        import "https://cdn.jsdelivr.net/npm/@perspective-dev/viewer-d3fc/dist/cdn/perspective-viewer-d3fc.js";
+        import perspective from "https://cdn.jsdelivr.net/npm/@perspective-dev/client/dist/cdn/perspective.js";
+
         // Focus search on / key
         document.addEventListener('keydown', function(e) {{
             if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
@@ -1030,21 +1032,16 @@ fn build_search_html(
             document.getElementById('end').value = end;
             document.querySelector('form').submit();
         }}
+        window.setTimeRange = setTimeRange;
 
         // Initialize Perspective
-        window.addEventListener('DOMContentLoaded', async function() {{
-            try {{
-                // Wait for the perspective-viewer custom element to be defined
-                await customElements.whenDefined('perspective-viewer');
+        try {{
+            const viewer = document.getElementById('perspective-viewer');
+            const dataElement = document.getElementById('results-data');
 
-                const viewer = document.getElementById('perspective-viewer');
-                const dataElement = document.getElementById('results-data');
-
-                if (!viewer) {{
-                    console.error('Perspective viewer element not found');
-                    return;
-                }}
-
+            if (!viewer) {{
+                console.error('Perspective viewer element not found');
+            }} else {{
                 let data = [];
                 if (dataElement && dataElement.textContent.trim()) {{
                     try {{
@@ -1055,26 +1052,32 @@ fn build_search_html(
                         }}
                     }} catch (parseError) {{
                         console.error('Failed to parse JSON:', parseError);
-                        return;
                     }}
                 }}
 
-                // Load data into the viewer (creates a Perspective table internally)
-                console.log('Loading data into Perspective...');
-                await viewer.load(data);
-                console.log('Data loaded successfully');
+                if (data.length > 0) {{
+                    // Create a Perspective worker and table
+                    const worker = await perspective.worker();
+                    await worker.table(data, {{ name: "results" }});
 
-                // Get the table to verify it loaded
-                const table = await viewer.getTable();
-                const schema = await table.schema();
-                console.log('Table schema:', schema);
+                    // Load the worker into the viewer
+                    await viewer.load(worker);
 
-            }} catch (error) {{
-                console.error('Failed to initialize Perspective:', error);
-                console.error('Error details:', error.message, error.stack);
+                    // Configure the viewer
+                    await viewer.restore({{
+                        table: "results",
+                        plugin: "Datagrid",
+                        theme: "Pro Dark",
+                        settings: false
+                    }});
+
+                    console.log('Perspective initialized successfully');
+                }}
             }}
-        }});
-        window.setTimeRange = setTimeRange;
+        }} catch (error) {{
+            console.error('Failed to initialize Perspective:', error);
+            console.error('Error details:', error.message, error.stack);
+        }}
     </script>
 </body>
 </html>"##,
