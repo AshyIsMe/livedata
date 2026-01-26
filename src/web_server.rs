@@ -1036,21 +1036,39 @@ fn build_search_html(
             try {{
                 const viewer = document.getElementById('perspective-viewer');
                 const dataElement = document.getElementById('results-data');
-                let data = [];
 
-                if (dataElement && dataElement.textContent.trim()) {{
-                    data = JSON.parse(dataElement.textContent);
+                if (!viewer) {{
+                    console.error('Perspective viewer element not found');
+                    return;
                 }}
 
-                console.log('Loading', data.length, 'rows into Perspective');
+                let data = [];
+                if (dataElement && dataElement.textContent.trim()) {{
+                    try {{
+                        data = JSON.parse(dataElement.textContent);
+                        console.log('Parsed', data.length, 'rows');
+                        if (data.length > 0) {{
+                            console.log('Sample row:', data[0]);
+                        }}
+                    }} catch (parseError) {{
+                        console.error('Failed to parse JSON:', parseError);
+                        return;
+                    }}
+                }}
 
-                // Load data into the viewer
+                // Load data into the viewer (creates a Perspective table internally)
+                console.log('Loading data into Perspective...');
                 await viewer.load(data);
+                console.log('Data loaded successfully');
 
-                // Configure the view
-                viewer.setAttribute('sort', JSON.stringify([['timestamp', 'desc']]));
+                // Get the table to verify it loaded
+                const table = await viewer.getTable();
+                const schema = await table.schema();
+                console.log('Table schema:', schema);
+
             }} catch (error) {{
                 console.error('Failed to initialize Perspective:', error);
+                console.error('Error details:', error.message, error.stack);
             }}
         }});
         window.setTimeRange = setTimeRange;
