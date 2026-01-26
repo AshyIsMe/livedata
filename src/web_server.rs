@@ -1034,6 +1034,9 @@ fn build_search_html(
         // Initialize Perspective
         window.addEventListener('DOMContentLoaded', async function() {{
             try {{
+                // Wait for the perspective-viewer custom element to be defined
+                await customElements.whenDefined('perspective-viewer');
+
                 const viewer = document.getElementById('perspective-viewer');
                 const dataElement = document.getElementById('results-data');
 
