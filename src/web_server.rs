@@ -51,7 +51,7 @@ pub struct SearchParams {
     /// Max priority level (0-7, lower = more severe)
     #[serde(default)]
     pub priority: Option<u8>,
-    /// Results per page (default: 100, max: 10000)
+    /// Results per page (default: 100, max: 100000)
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Pagination offset
@@ -74,7 +74,7 @@ fn default_end() -> String {
 }
 
 fn default_limit() -> usize {
-    100
+    100_000
 }
 
 fn default_sort() -> String {
@@ -243,7 +243,7 @@ async fn api_search(
     let end = parse_time(&params.end, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Validate and clamp limit
-    let limit = params.limit.min(10000);
+    let limit = params.limit.min(100_000);
 
     // Build SQL query against the journal_logs table
     let mut sql = format!(
@@ -420,7 +420,7 @@ async fn search_ui(
     let end = parse_time(&params.end, now).unwrap_or(now);
 
     // Execute search query
-    let limit = params.limit.min(10000);
+    let limit = params.limit.min(100_000);
 
     let mut sql = format!(
         "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
@@ -607,7 +607,7 @@ fn build_search_html(
         .join("\n");
 
     // Calculate pagination
-    let limit = params.limit.min(10000);
+    let limit = params.limit.min(100_000);
     let current_page = params.offset / limit + 1;
     let total_pages = total_count.div_ceil(limit);
 
@@ -1083,7 +1083,7 @@ fn build_search_html(
         hostname_options,
         unit_options,
         priority_options,
-        params.limit.min(10000),
+        params.limit.min(100_000),
         pagination.clone(),
         if results.is_empty() {
             "<div class=\"no-results\">No results found. Try adjusting your search or time range.</div>".to_string()
