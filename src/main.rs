@@ -2,8 +2,10 @@ use anyhow::Result;
 use clap::Parser;
 use livedata::app_controller::ApplicationController;
 use livedata::web_server::run_web_server;
-use log::info;
 use std::thread;
+use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// livedata - Journald log collector with DuckDB storage
 #[derive(Parser, Debug)]
@@ -28,9 +30,17 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // Initialize logging
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
+    // Initialize logging to both stdout and journald
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_level(true);
+
+    let journald_layer = tracing_journald::layer().ok();
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with(fmt_layer)
+        .with(journald_layer)
         .init();
 
     info!("Starting journald log collector with DuckDB storage");

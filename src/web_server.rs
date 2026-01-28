@@ -204,7 +204,7 @@ pub async fn run_web_server(data_dir: &str, shutdown_signal: Arc<AtomicBool>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
-    println!("Web server listening on {}", listener.local_addr().unwrap());
+    log::info!("Web server listening on {}", listener.local_addr().unwrap());
 
     // Run axum server with graceful shutdown
     axum::serve(listener, app)

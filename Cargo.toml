@@ -13,7 +13,6 @@ serde_json = "1.0"         # JSON serialization
 tokio = { version = "1.49", features = ["full"] }
 anyhow = "1.0"             # error handling
 log = "0.4"                # logging
-env_logger = "0.10"        # logger implementation
 clap = { version = "4.0", features = ["derive"] }  # command line argument parsing
 signal-hook = "0.3"        # signal handling
 tempfile = "3.24"            # temporary directories for tests
@@ -22,6 +21,7 @@ axum = "0.8.8"
 tower-http = { version = "0.6.8", features = ["fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-journald = "0.3.2"
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
