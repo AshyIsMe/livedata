@@ -1001,7 +1001,7 @@ fn build_search_html(
         {}
 
         <div class="perspective-container">
-            <perspective-viewer id="perspective-viewer"></perspective-viewer>
+            <perspective-viewer id="perspective-viewer" theme="Pro Dark"></perspective-viewer>
         </div>
 
         {}
