@@ -692,11 +692,8 @@ fn build_search_html(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective@2.10.1/dist/cdn/perspective.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@2.10.1/dist/cdn/perspective-viewer.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-datagrid@2.10.1/dist/cdn/perspective-viewer-datagrid.js"></script>
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer-d3fc@2.10.1/dist/cdn/perspective-viewer-d3fc.js"></script>
-    <link rel="stylesheet" crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/@finos/perspective-viewer@2.10.1/dist/css/themes.css" />
+    <link href="https://unpkg.com/tabulator-tables@6.3.1/dist/css/tabulator_midnight.min.css" rel="stylesheet">
+    <script type="text/javascript" src="https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator.min.js"></script>
     <style>
         * {{
             box-sizing: border-box;
@@ -921,18 +918,33 @@ fn build_search_html(
                 flex-wrap: wrap;
             }}
         }}
-        perspective-viewer {{
+        #results-table {{
             height: 600px;
-            width: 100%;
-            display: block;
+            background-color: #16213e;
             border-radius: 8px;
             overflow: hidden;
         }}
-        .perspective-container {{
+        .tabulator {{
             background-color: #16213e;
-            padding: 0;
+            border: none;
             border-radius: 8px;
-            overflow: hidden;
+        }}
+        .tabulator .tabulator-header {{
+            background-color: #16213e;
+            border-bottom: 2px solid #0f3460;
+        }}
+        .tabulator .tabulator-header .tabulator-col {{
+            background-color: #16213e;
+            border-right-color: #0f3460;
+        }}
+        .tabulator .tabulator-header .tabulator-col .tabulator-col-title {{
+            color: #00d9ff;
+        }}
+        .tabulator .tabulator-tableholder .tabulator-table .tabulator-row {{
+            border-bottom: 1px solid #0f3460;
+        }}
+        .tabulator .tabulator-tableholder .tabulator-table .tabulator-row .tabulator-cell {{
+            border-right-color: #0f3460;
         }}
     </style>
 </head>
@@ -1000,9 +1012,7 @@ fn build_search_html(
 
         {}
 
-        <div class="perspective-container">
-            <perspective-viewer id="perspective-viewer" theme="Pro Dark"></perspective-viewer>
-        </div>
+        <div id="results-table"></div>
 
         {}
     </div>
@@ -1011,9 +1021,7 @@ fn build_search_html(
         {}
     </script>
 
-    <script type="module">
-        import perspective from "https://cdn.jsdelivr.net/npm/@finos/perspective@2.10.1/dist/cdn/perspective.js";
-
+    <script>
         // Focus search on / key
         document.addEventListener('keydown', function(e) {{
             if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
@@ -1028,51 +1036,46 @@ fn build_search_html(
             document.getElementById('end').value = end;
             document.querySelector('form').submit();
         }}
-        window.setTimeRange = setTimeRange;
 
-        // Initialize Perspective
+        // Initialize Tabulator
         try {{
-            // Wait for custom element to be defined
-            await customElements.whenDefined('perspective-viewer');
-
-            const viewer = document.getElementById('perspective-viewer');
             const dataElement = document.getElementById('results-data');
-
-            if (!viewer) {{
-                console.error('Perspective viewer element not found');
-            }} else {{
-                let data = [];
-                if (dataElement && dataElement.textContent.trim()) {{
-                    try {{
-                        data = JSON.parse(dataElement.textContent);
-                        console.log('Parsed', data.length, 'rows');
-                        if (data.length > 0) {{
-                            console.log('Sample row:', data[0]);
-                        }}
-                    }} catch (parseError) {{
-                        console.error('Failed to parse JSON:', parseError);
-                    }}
-                }}
-
-                if (data.length > 0) {{
-                    // Create a Perspective worker and table
-                    const worker = await perspective.worker();
-                    const table = await worker.table(data);
-
-                    // Load the table into the viewer
-                    await viewer.load(table);
-
-                    // Set column order with timestamp first
-                    await viewer.restore({{
-                        columns: ["timestamp", "hostname", "unit", "priority", "comm", "message"]
-                    }});
-
-                    console.log('Perspective initialized successfully');
+            let data = [];
+            if (dataElement && dataElement.textContent.trim()) {{
+                try {{
+                    data = JSON.parse(dataElement.textContent);
+                }} catch (parseError) {{
+                    console.error('Failed to parse JSON:', parseError);
                 }}
             }}
+
+            if (data.length > 0) {{
+                const table = new Tabulator("#results-table", {{
+                    data: data,
+                    layout: "fitColumns",
+                    height: "600px",
+                    columns: [
+                        {{title: "Timestamp", field: "timestamp", width: 200, cssClass: "monospace"}},
+                        {{title: "Hostname", field: "hostname", width: 120}},
+                        {{title: "Unit", field: "unit", width: 150}},
+                        {{title: "Priority", field: "priority", width: 70, hozAlign: "center"}},
+                        {{title: "Comm", field: "comm", width: 120}},
+                        {{title: "Message", field: "message", formatter: "plaintext", cssClass: "monospace"}},
+                    ],
+                    rowFormatter: function(row) {{
+                        const p = row.getData().priority;
+                        if (p <= 2) {{
+                            row.getElement().style.backgroundColor = "rgba(255, 0, 0, 0.15)";
+                        }} else if (p <= 3) {{
+                            row.getElement().style.backgroundColor = "rgba(255, 100, 0, 0.1)";
+                        }} else if (p <= 4) {{
+                            row.getElement().style.backgroundColor = "rgba(255, 200, 0, 0.05)";
+                        }}
+                    }},
+                }});
+            }}
         }} catch (error) {{
-            console.error('Failed to initialize Perspective:', error);
-            console.error('Error details:', error.message, error.stack);
+            console.error('Failed to initialize Tabulator:', error);
         }}
     </script>
 </body>
