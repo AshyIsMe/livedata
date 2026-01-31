@@ -63,6 +63,9 @@ pub struct SearchParams {
     /// Sort direction (asc or desc)
     #[serde(default = "default_sort_dir")]
     pub sort_dir: String,
+    /// Comma-separated list of columns to include
+    #[serde(default)]
+    pub columns: Option<String>,
 }
 
 fn default_start() -> String {
@@ -85,7 +88,7 @@ fn default_sort_dir() -> String {
     "desc".to_string()
 }
 
-/// Search result entry
+/// Search result entry (used for default columns)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
     pub timestamp: String,
@@ -97,15 +100,38 @@ pub struct SearchResult {
     pub message: Option<String>,
 }
 
-/// Search response
+/// Search response with dynamic results
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
-    pub results: Vec<SearchResult>,
+    pub results: Vec<serde_json::Value>,
+    pub columns: Vec<String>,
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
     pub query_time_ms: u128,
 }
+
+/// Column info for /api/columns endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub column_type: String,
+    pub default: bool,
+}
+
+/// Internal columns to exclude from the column chooser
+const EXCLUDED_COLUMNS: &[&str] = &["__CURSOR", "__MONOTONIC_TIMESTAMP", "minute_key"];
+
+/// Default columns shown when no column selection is made
+const DEFAULT_COLUMNS: &[&str] = &[
+    "timestamp",
+    "_hostname",
+    "_systemd_unit",
+    "priority",
+    "_pid",
+    "_comm",
+    "message",
+];
 
 /// Filter values response
 #[derive(Debug, Serialize, Deserialize)]
@@ -197,6 +223,7 @@ pub async fn run_web_server(data_dir: &str, shutdown_signal: Arc<AtomicBool>) {
     let app = Router::new()
         .route("/", get(search_ui))
         .route("/api/search", get(api_search))
+        .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/health", get(health))
         .with_state(state);
@@ -230,6 +257,68 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     })
 }
 
+/// Get valid column names from the journal_logs schema
+fn get_schema_columns(conn: &Connection) -> Vec<(String, String)> {
+    conn.prepare("DESCRIBE journal_logs")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Validate requested columns against the actual schema, returning SQL expressions
+fn validate_columns(requested: &[&str], schema: &[(String, String)]) -> Vec<String> {
+    let schema_names: std::collections::HashSet<&str> =
+        schema.iter().map(|(name, _)| name.as_str()).collect();
+    requested
+        .iter()
+        .filter(|col| schema_names.contains(**col))
+        .map(|col| {
+            // Cast certain columns for display
+            match *col {
+                "timestamp" => "CAST(timestamp AS VARCHAR)".to_string(),
+                "_pid" => "CAST(_pid AS VARCHAR)".to_string(),
+                other => other.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Column alias for display (strips leading underscore, etc.)
+fn column_display_name(col: &str) -> String {
+    match col {
+        "CAST(timestamp AS VARCHAR)" | "timestamp" => "timestamp".to_string(),
+        "CAST(_pid AS VARCHAR)" | "_pid" => "pid".to_string(),
+        "_hostname" => "hostname".to_string(),
+        "_systemd_unit" => "unit".to_string(),
+        "_comm" => "comm".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// API columns endpoint returning available columns
+async fn api_columns(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ColumnInfo>>, (StatusCode, String)> {
+    let conn = state.conn.lock().unwrap();
+    let schema = get_schema_columns(&conn);
+
+    let columns: Vec<ColumnInfo> = schema
+        .iter()
+        .filter(|(name, _)| !EXCLUDED_COLUMNS.contains(&name.as_str()))
+        .map(|(name, col_type)| ColumnInfo {
+            name: name.clone(),
+            column_type: col_type.clone(),
+            default: DEFAULT_COLUMNS.contains(&name.as_str()),
+        })
+        .collect();
+
+    Ok(Json(columns))
+}
+
 /// API search endpoint returning JSON results
 async fn api_search(
     State(state): State<Arc<AppState>>,
@@ -245,11 +334,42 @@ async fn api_search(
     // Validate and clamp limit
     let limit = params.limit.min(100_000);
 
+    let conn = state.conn.lock().unwrap();
+
+    // Determine which columns to select
+    let schema = get_schema_columns(&conn);
+
+    // If the table doesn't exist yet, return empty results
+    if schema.is_empty() {
+        return Ok(Json(SearchResponse {
+            results: Vec::new(),
+            columns: DEFAULT_COLUMNS.iter().map(|c| column_display_name(c)).collect(),
+            total: 0,
+            limit,
+            offset: params.offset,
+            query_time_ms: start_time.elapsed().as_millis(),
+        }));
+    }
+
+    let requested_cols: Vec<&str> = if let Some(ref cols) = params.columns
+        && !cols.is_empty()
+    {
+        cols.split(',').map(|s| s.trim()).collect()
+    } else {
+        DEFAULT_COLUMNS.to_vec()
+    };
+    let select_exprs = validate_columns(&requested_cols, &schema);
+    if select_exprs.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No valid columns specified".into()));
+    }
+
+    // Build display names for the response
+    let display_names: Vec<String> = select_exprs.iter().map(|e| column_display_name(e)).collect();
+
     // Build SQL query against the journal_logs table
     let mut sql = format!(
-        "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
-         FROM journal_logs
-         WHERE timestamp >= '{}' AND timestamp < '{}'",
+        "SELECT {} FROM journal_logs WHERE timestamp >= '{}' AND timestamp < '{}'",
+        select_exprs.join(", "),
         start.to_rfc3339(),
         end.to_rfc3339()
     );
@@ -298,37 +418,40 @@ async fn api_search(
         "unit" => "_systemd_unit",
         "priority" | "pri" => "priority",
         "comm" => "_comm",
-        _ => "timestamp", // Default to timestamp for invalid values
+        _ => "timestamp",
     };
 
     let sort_direction = match params.sort_dir.to_lowercase().as_str() {
         "asc" => "ASC",
         "desc" => "DESC",
-        _ => "DESC", // Default to DESC for invalid values
+        _ => "DESC",
     };
 
-    // Add ordering and pagination
     sql.push_str(&format!(
         " ORDER BY {} {} LIMIT {} OFFSET {}",
         sort_column, sort_direction, limit, params.offset
     ));
 
-    // Execute query
-    let conn = state.conn.lock().unwrap();
-
-    // Handle case where no parquet files exist (returns empty results)
-    let results: Vec<SearchResult> = match conn.prepare(&sql) {
+    // Execute query with dynamic column mapping
+    let col_count = select_exprs.len();
+    let results: Vec<serde_json::Value> = match conn.prepare(&sql) {
         Ok(mut stmt) => stmt
             .query_map([], |row| {
-                Ok(SearchResult {
-                    timestamp: row.get::<_, String>(0)?,
-                    hostname: row.get::<_, Option<String>>(1)?,
-                    unit: row.get::<_, Option<String>>(2)?,
-                    priority: row.get::<_, Option<i32>>(3)?,
-                    pid: row.get::<_, Option<String>>(4)?,
-                    comm: row.get::<_, Option<String>>(5)?,
-                    message: row.get::<_, Option<String>>(6)?,
-                })
+                let mut map = serde_json::Map::new();
+                for (i, name) in display_names.iter().enumerate().take(col_count) {
+                    // Try string first, fall back to i64, then null
+                    let val = if let Ok(v) = row.get::<_, String>(i) {
+                        serde_json::Value::String(v)
+                    } else if let Ok(v) = row.get::<_, i64>(i) {
+                        serde_json::Value::Number(v.into())
+                    } else if let Ok(v) = row.get::<_, f64>(i) {
+                        serde_json::json!(v)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    map.insert(name.clone(), val);
+                }
+                Ok(serde_json::Value::Object(map))
             })
             .map_err(|e| {
                 (
@@ -344,7 +467,6 @@ async fn api_search(
                 )
             })?,
         Err(e) => {
-            // If table doesn't exist yet (no data collected), return empty results
             let err_str = e.to_string();
             if err_str.contains("does not exist") || err_str.contains("journal_logs") {
                 Vec::new()
@@ -362,6 +484,7 @@ async fn api_search(
 
     Ok(Json(SearchResponse {
         results,
+        columns: display_names,
         total,
         limit,
         offset: params.offset,
@@ -419,13 +542,47 @@ async fn search_ui(
     let start = parse_time(&params.start, now).unwrap_or(now - Duration::hours(1));
     let end = parse_time(&params.end, now).unwrap_or(now);
 
-    // Execute search query
     let limit = params.limit.min(100_000);
+    let conn = state.conn.lock().unwrap();
+
+    // Determine which columns to select
+    let schema = get_schema_columns(&conn);
+    let requested_cols: Vec<&str> = if let Some(ref cols) = params.columns
+        && !cols.is_empty()
+    {
+        cols.split(',').map(|s| s.trim()).collect()
+    } else {
+        DEFAULT_COLUMNS.to_vec()
+    };
+    let select_exprs = validate_columns(&requested_cols, &schema);
+    let select_list = if select_exprs.is_empty() {
+        DEFAULT_COLUMNS
+            .iter()
+            .filter_map(|c| {
+                let exprs = validate_columns(&[c], &schema);
+                exprs.into_iter().next()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        select_exprs
+    };
+    let display_names: Vec<String> =
+        select_list.iter().map(|e| column_display_name(e)).collect();
+
+    // Get all available columns for the column chooser
+    let all_columns: Vec<ColumnInfo> = schema
+        .iter()
+        .filter(|(name, _)| !EXCLUDED_COLUMNS.contains(&name.as_str()))
+        .map(|(name, col_type)| ColumnInfo {
+            name: name.clone(),
+            column_type: col_type.clone(),
+            default: DEFAULT_COLUMNS.contains(&name.as_str()),
+        })
+        .collect();
 
     let mut sql = format!(
-        "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message
-         FROM journal_logs
-         WHERE timestamp >= '{}' AND timestamp < '{}'",
+        "SELECT {} FROM journal_logs WHERE timestamp >= '{}' AND timestamp < '{}'",
+        select_list.join(", "),
         start.to_rfc3339(),
         end.to_rfc3339()
     );
@@ -467,10 +624,10 @@ async fn search_ui(
         sql.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
     }
 
-    // Count total results (for pagination info)
-    let count_sql = sql.replace(
-        "SELECT CAST(timestamp AS VARCHAR), _hostname, _systemd_unit, priority, CAST(_pid AS VARCHAR), _comm, message",
-        "SELECT COUNT(*)",
+    // Count total results
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM journal_logs WHERE {}",
+        sql.split("WHERE ").nth(1).unwrap_or("1=1").split(" ORDER BY").next().unwrap_or("1=1")
     );
 
     // Validate and build ORDER BY clause
@@ -480,22 +637,19 @@ async fn search_ui(
         "unit" => "_systemd_unit",
         "priority" | "pri" => "priority",
         "comm" => "_comm",
-        _ => "timestamp", // Default to timestamp for invalid values
+        _ => "timestamp",
     };
 
     let sort_direction = match params.sort_dir.to_lowercase().as_str() {
         "asc" => "ASC",
         "desc" => "DESC",
-        _ => "DESC", // Default to DESC for invalid values
+        _ => "DESC",
     };
 
-    // Add ordering and pagination
     sql.push_str(&format!(
         " ORDER BY {} {} LIMIT {} OFFSET {}",
         sort_column, sort_direction, limit, params.offset
     ));
-
-    let conn = state.conn.lock().unwrap();
 
     // Get total count
     let total_count: usize = conn
@@ -503,20 +657,26 @@ async fn search_ui(
         .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
         .unwrap_or(0);
 
-    // Execute main query
-    let results: Vec<SearchResult> = conn
+    // Execute main query with dynamic columns
+    let col_count = select_list.len();
+    let results: Vec<serde_json::Value> = conn
         .prepare(&sql)
         .and_then(|mut stmt| {
             stmt.query_map([], |row| {
-                Ok(SearchResult {
-                    timestamp: row.get::<_, String>(0)?,
-                    hostname: row.get::<_, Option<String>>(1)?,
-                    unit: row.get::<_, Option<String>>(2)?,
-                    priority: row.get::<_, Option<i32>>(3)?,
-                    pid: row.get::<_, Option<String>>(4)?,
-                    comm: row.get::<_, Option<String>>(5)?,
-                    message: row.get::<_, Option<String>>(6)?,
-                })
+                let mut map = serde_json::Map::new();
+                for (i, name) in display_names.iter().enumerate().take(col_count) {
+                    let val = if let Ok(v) = row.get::<_, String>(i) {
+                        serde_json::Value::String(v)
+                    } else if let Ok(v) = row.get::<_, i64>(i) {
+                        serde_json::Value::Number(v.into())
+                    } else if let Ok(v) = row.get::<_, f64>(i) {
+                        serde_json::json!(v)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    map.insert(name.clone(), val);
+                }
+                Ok(serde_json::Value::Object(map))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
@@ -622,6 +782,8 @@ async fn search_ui(
     let html = build_search_html(
         &params,
         &results,
+        &display_names,
+        &all_columns,
         total_count,
         &hostnames,
         &units,
@@ -637,7 +799,9 @@ async fn search_ui(
 #[allow(clippy::too_many_arguments)]
 fn build_search_html(
     params: &SearchParams,
-    results: &[SearchResult],
+    results: &[serde_json::Value],
+    display_names: &[String],
+    all_columns: &[ColumnInfo],
     total_count: usize,
     hostnames: &[String],
     units: &[String],
@@ -759,25 +923,18 @@ fn build_search_html(
         )
     };
 
-    // Serialize results as JSON for Perspective
-    // Escape for safe embedding in HTML (prevent </script> and other HTML issues)
-    let results_json = serde_json::to_string(
-        &results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "timestamp": r.timestamp,
-                    "hostname": r.hostname.as_deref().unwrap_or("-"),
-                    "unit": r.unit.as_deref().unwrap_or("-"),
-                    "priority": r.priority.unwrap_or(-1),
-                    "comm": r.comm.as_deref().unwrap_or("-"),
-                    "message": r.message.as_deref().unwrap_or("-"),
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| "[]".to_string())
-    .replace("</", "<\\/"); // Prevent closing script tag in JSON strings
+    // Serialize results as JSON for Tabulator
+    let results_json = serde_json::to_string(results)
+        .unwrap_or_else(|_| "[]".to_string())
+        .replace("</", "<\\/");
+
+    // Serialize column info and active display names for the frontend
+    let columns_json = serde_json::to_string(all_columns)
+        .unwrap_or_else(|_| "[]".to_string())
+        .replace("</", "<\\/");
+    let active_columns_json = serde_json::to_string(display_names)
+        .unwrap_or_else(|_| "[]".to_string())
+        .replace("</", "<\\/");
 
     format!(
         r##"<!DOCTYPE html>
@@ -1048,6 +1205,76 @@ fn build_search_html(
             border-radius: 8px;
             overflow: hidden;
         }}
+        .column-chooser-wrapper {{
+            position: relative;
+            display: inline-block;
+        }}
+        .column-chooser-btn {{
+            background-color: #0f3460;
+            color: #00d9ff;
+            border: 1px solid #00d9ff;
+            padding: 8px 14px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .column-chooser-btn:hover {{
+            background-color: #00d9ff;
+            color: #1a1a2e;
+        }}
+        .column-chooser-panel {{
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            z-index: 100;
+            background-color: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 12px;
+            min-width: 250px;
+            max-height: 400px;
+            overflow-y: auto;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }}
+        .column-chooser-panel.open {{
+            display: block;
+        }}
+        .column-chooser-panel label {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            color: #ccc;
+            font-size: 0.85rem;
+            cursor: pointer;
+        }}
+        .column-chooser-panel label:hover {{
+            color: #fff;
+        }}
+        .column-chooser-panel input[type="checkbox"] {{
+            accent-color: #00d9ff;
+            width: 16px;
+            height: 16px;
+        }}
+        .column-chooser-panel .col-type {{
+            color: #666;
+            font-size: 0.75rem;
+            margin-left: auto;
+        }}
+        .column-chooser-panel .col-actions {{
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #0f3460;
+        }}
+        .column-chooser-panel .col-actions button {{
+            flex: 1;
+            padding: 6px 10px;
+            font-size: 0.8rem;
+        }}
         .tabulator {{
             background-color: #16213e;
             border: none;
@@ -1086,6 +1313,13 @@ fn build_search_html(
                 <div class="form-group">
                     <label>&nbsp;</label>
                     <button type="submit">Search</button>
+                </div>
+                <div class="form-group">
+                    <label>&nbsp;</label>
+                    <div class="column-chooser-wrapper">
+                        <button type="button" class="column-chooser-btn" id="col-chooser-toggle">Columns</button>
+                        <div class="column-chooser-panel" id="col-chooser-panel"></div>
+                    </div>
                 </div>
             </div>
             <div class="search-row">
@@ -1130,6 +1364,7 @@ fn build_search_html(
             </div>
             <input type="hidden" name="limit" value="{}">
             <input type="hidden" name="offset" value="0">
+            <input type="hidden" name="columns" id="columns-input" value="{}">
         </form>
 
         {}
@@ -1157,6 +1392,9 @@ fn build_search_html(
             data-start="{}" data-end="{}" data-default-bin="{}">
         {}
     </script>
+
+    <script type="application/json" id="columns-data">{}</script>
+    <script type="application/json" id="active-columns-data">{}</script>
 
     <script>
         // Initialize timechart
@@ -1313,53 +1551,147 @@ fn build_search_html(
             }}
         }}
 
+        // Build dynamic column definitions
+        const activeColumns = JSON.parse(document.getElementById('active-columns-data').textContent || '[]');
+        const knownWidths = {{timestamp: 200, hostname: 120, unit: 150, priority: 70, comm: 120, pid: 80}};
+        const knownAlign = {{priority: "center"}};
+
+        function buildColumns(cols) {{
+            return cols.map(field => {{
+                const def = {{title: field.charAt(0).toUpperCase() + field.slice(1), field: field}};
+                if (knownWidths[field]) def.width = knownWidths[field];
+                if (knownAlign[field]) def.hozAlign = knownAlign[field];
+                return def;
+            }});
+        }}
+
         if (data.length > 0) {{
             new Tabulator("#results-table", {{
                 data: data,
                 layout: "fitColumns",
                 height: "600px",
-                columns: [
-                    {{title: "Timestamp", field: "timestamp", width: 200}},
-                    {{title: "Hostname", field: "hostname", width: 120}},
-                    {{title: "Unit", field: "unit", width: 150}},
-                    {{title: "Priority", field: "priority", width: 70, hozAlign: "center"}},
-                    {{title: "Comm", field: "comm", width: 120}},
-                    {{title: "Message", field: "message"}},
-                ],
+                columns: buildColumns(activeColumns),
                 rowFormatter: function(row) {{
                     const p = row.getData().priority;
-                    if (p <= 2) {{
-                        row.getElement().style.backgroundColor = "rgba(255, 0, 0, 0.15)";
-                    }} else if (p <= 3) {{
-                        row.getElement().style.backgroundColor = "rgba(255, 100, 0, 0.1)";
-                    }} else if (p <= 4) {{
-                        row.getElement().style.backgroundColor = "rgba(255, 200, 0, 0.05)";
+                    if (p !== undefined && p !== null) {{
+                        if (p <= 2) {{
+                            row.getElement().style.backgroundColor = "rgba(255, 0, 0, 0.15)";
+                        }} else if (p <= 3) {{
+                            row.getElement().style.backgroundColor = "rgba(255, 100, 0, 0.1)";
+                        }} else if (p <= 4) {{
+                            row.getElement().style.backgroundColor = "rgba(255, 200, 0, 0.05)";
+                        }}
                     }}
                 }},
             }});
         }}
+
+        // Column chooser logic
+        (function() {{
+            const allCols = JSON.parse(document.getElementById('columns-data').textContent || '[]');
+            const panel = document.getElementById('col-chooser-panel');
+            const toggle = document.getElementById('col-chooser-toggle');
+            const columnsInput = document.getElementById('columns-input');
+            const form = document.querySelector('form');
+
+            // Load saved preferences from localStorage
+            let savedCols = null;
+            try {{
+                const stored = localStorage.getItem('livedata-columns');
+                if (stored) savedCols = JSON.parse(stored);
+            }} catch(e) {{}}
+
+            // Determine which columns are currently active
+            const currentActive = new Set(
+                columnsInput.value ? columnsInput.value.split(',') : allCols.filter(c => c.default).map(c => c.name)
+            );
+
+            // Build checkboxes
+            allCols.forEach(col => {{
+                const label = document.createElement('label');
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.value = col.name;
+                cb.checked = currentActive.has(col.name);
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = col.name;
+                const typeSpan = document.createElement('span');
+                typeSpan.className = 'col-type';
+                typeSpan.textContent = col.column_type;
+                label.appendChild(cb);
+                label.appendChild(nameSpan);
+                label.appendChild(typeSpan);
+                panel.appendChild(label);
+            }});
+
+            // Add Apply / Reset buttons
+            const actions = document.createElement('div');
+            actions.className = 'col-actions';
+            const applyBtn = document.createElement('button');
+            applyBtn.type = 'button';
+            applyBtn.textContent = 'Apply';
+            applyBtn.addEventListener('click', () => {{
+                const checked = Array.from(panel.querySelectorAll('input[type=checkbox]:checked')).map(cb => cb.value);
+                if (checked.length === 0) return;
+                localStorage.setItem('livedata-columns', JSON.stringify(checked));
+                columnsInput.value = checked.join(',');
+                form.submit();
+            }});
+            const resetBtn = document.createElement('button');
+            resetBtn.type = 'button';
+            resetBtn.textContent = 'Reset';
+            resetBtn.style.backgroundColor = '#0f3460';
+            resetBtn.style.color = '#ccc';
+            resetBtn.addEventListener('click', () => {{
+                localStorage.removeItem('livedata-columns');
+                columnsInput.value = '';
+                form.submit();
+            }});
+            actions.appendChild(applyBtn);
+            actions.appendChild(resetBtn);
+            panel.appendChild(actions);
+
+            // Toggle panel
+            toggle.addEventListener('click', (e) => {{
+                e.stopPropagation();
+                panel.classList.toggle('open');
+            }});
+            document.addEventListener('click', (e) => {{
+                if (!panel.contains(e.target) && e.target !== toggle) {{
+                    panel.classList.remove('open');
+                }}
+            }});
+
+            // On page load, if localStorage has saved columns, set the hidden input
+            if (savedCols && !columnsInput.value) {{
+                columnsInput.value = savedCols.join(',');
+            }}
+        }})();
     </script>
 </body>
 </html>"##,
-        html_escape(query_value),
-        html_escape(&params.start),
-        html_escape(&params.end),
-        hostname_options,
-        unit_options,
-        priority_options,
-        params.limit.min(100_000),
-        pagination.clone(),
-        if results.is_empty() {
+        html_escape(query_value),            // {0} search input value
+        html_escape(&params.start),            // {1} start time
+        html_escape(&params.end),              // {2} end time
+        hostname_options,                       // {3} hostname options
+        unit_options,                           // {4} unit options
+        priority_options,                       // {5} priority options
+        params.limit.min(100_000),             // {6} limit
+        params.columns.as_deref().unwrap_or(""), // {7} columns hidden input
+        pagination.clone(),                     // {8} top pagination
+        if results.is_empty() {                // {9} no-results message
             "<div class=\"no-results\">No results found. Try adjusting your search or time range.</div>".to_string()
         } else {
             "".to_string()
         },
-        pagination,
-        results_json,
-        start_iso,
-        end_iso,
-        bin_unit,
-        histogram_json,
+        pagination,                             // {10} bottom pagination
+        results_json,                           // {11} results JSON
+        start_iso,                              // {12} histogram start
+        end_iso,                                // {13} histogram end
+        bin_unit,                               // {14} default bin
+        histogram_json,                         // {15} histogram data
+        columns_json,                           // {16} all columns info
+        active_columns_json,                    // {17} active column names
     )
 }
 
@@ -1396,6 +1728,7 @@ fn create_test_app(data_dir: &str) -> Router {
     Router::new()
         .route("/", get(search_ui))
         .route("/api/search", get(api_search))
+        .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/health", get(health))
         .with_state(state)
