@@ -30,17 +30,14 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // Initialize logging to both stdout and journald
+    // Initialize logging to stdout
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_level(true);
 
-    let journald_layer = tracing_journald::layer().ok();
-
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
         .with(fmt_layer)
-        .with(journald_layer)
         .init();
 
     info!("Starting journald log collector with DuckDB storage");
