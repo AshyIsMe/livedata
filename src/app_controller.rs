@@ -124,18 +124,29 @@ impl ApplicationController {
         // Calculate cutoff time (1 hour ago)
         let cutoff_time = Utc::now() - TimeDelta::hours(1);
 
-        // Process historical entries from the last hour
-        let processed_count =
-            self.journal_reader
-                .process_historical_entries(cutoff_time, |entry| {
-                    // Add entry to buffer (now persisted to on-disk DuckDB)
-                    self.buffer.add_entry(entry)
-                })?;
+        // Process historical entries from the last hour in a single transaction
+        // to avoid per-row auto-commit overhead
+        self.buffer.conn.execute("BEGIN TRANSACTION", [])?;
+        let result = self
+            .journal_reader
+            .process_historical_entries(cutoff_time, |entry| {
+                self.buffer.add_entry(entry)
+            });
+        match result {
+            Ok(count) => {
+                self.buffer.conn.execute("COMMIT", [])?;
+                let processed_count = count;
 
-        info!(
-            "Processed {} historical entries from the last hour (stored in DuckDB)",
-            processed_count
-        );
+                info!(
+                    "Processed {} historical entries from the last hour (stored in DuckDB)",
+                    processed_count
+                );
+            }
+            Err(e) => {
+                let _ = self.buffer.conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
+        }
 
         // Now seek to tail for real-time monitoring
         self.journal_reader.seek_to_tail()?;
