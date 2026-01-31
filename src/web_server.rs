@@ -74,7 +74,7 @@ fn default_end() -> String {
 }
 
 fn default_limit() -> usize {
-    100_000
+    1_000
 }
 
 fn default_sort() -> String {
@@ -693,7 +693,6 @@ fn build_search_html(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
     <link href="https://unpkg.com/tabulator-tables@6.3.1/dist/css/tabulator_midnight.min.css" rel="stylesheet">
-    <script type="text/javascript" src="https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator.min.js"></script>
     <style>
         * {{
             box-sizing: border-box;
@@ -1021,7 +1020,9 @@ fn build_search_html(
         {}
     </script>
 
-    <script>
+    <script type="module">
+        import {{TabulatorFull as Tabulator}} from "https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator_esm.min.js";
+
         // Focus search on / key
         document.addEventListener('keydown', function(e) {{
             if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
@@ -1036,46 +1037,43 @@ fn build_search_html(
             document.getElementById('end').value = end;
             document.querySelector('form').submit();
         }}
+        window.setTimeRange = setTimeRange;
 
         // Initialize Tabulator
-        try {{
-            const dataElement = document.getElementById('results-data');
-            let data = [];
-            if (dataElement && dataElement.textContent.trim()) {{
-                try {{
-                    data = JSON.parse(dataElement.textContent);
-                }} catch (parseError) {{
-                    console.error('Failed to parse JSON:', parseError);
-                }}
+        const dataElement = document.getElementById('results-data');
+        let data = [];
+        if (dataElement && dataElement.textContent.trim()) {{
+            try {{
+                data = JSON.parse(dataElement.textContent);
+            }} catch (parseError) {{
+                console.error('Failed to parse JSON:', parseError);
             }}
+        }}
 
-            if (data.length > 0) {{
-                const table = new Tabulator("#results-table", {{
-                    data: data,
-                    layout: "fitColumns",
-                    height: "600px",
-                    columns: [
-                        {{title: "Timestamp", field: "timestamp", width: 200, cssClass: "monospace"}},
-                        {{title: "Hostname", field: "hostname", width: 120}},
-                        {{title: "Unit", field: "unit", width: 150}},
-                        {{title: "Priority", field: "priority", width: 70, hozAlign: "center"}},
-                        {{title: "Comm", field: "comm", width: 120}},
-                        {{title: "Message", field: "message", formatter: "plaintext", cssClass: "monospace"}},
-                    ],
-                    rowFormatter: function(row) {{
-                        const p = row.getData().priority;
-                        if (p <= 2) {{
-                            row.getElement().style.backgroundColor = "rgba(255, 0, 0, 0.15)";
-                        }} else if (p <= 3) {{
-                            row.getElement().style.backgroundColor = "rgba(255, 100, 0, 0.1)";
-                        }} else if (p <= 4) {{
-                            row.getElement().style.backgroundColor = "rgba(255, 200, 0, 0.05)";
-                        }}
-                    }},
-                }});
-            }}
-        }} catch (error) {{
-            console.error('Failed to initialize Tabulator:', error);
+        if (data.length > 0) {{
+            new Tabulator("#results-table", {{
+                data: data,
+                layout: "fitColumns",
+                height: "600px",
+                columns: [
+                    {{title: "Timestamp", field: "timestamp", width: 200}},
+                    {{title: "Hostname", field: "hostname", width: 120}},
+                    {{title: "Unit", field: "unit", width: 150}},
+                    {{title: "Priority", field: "priority", width: 70, hozAlign: "center"}},
+                    {{title: "Comm", field: "comm", width: 120}},
+                    {{title: "Message", field: "message"}},
+                ],
+                rowFormatter: function(row) {{
+                    const p = row.getData().priority;
+                    if (p <= 2) {{
+                        row.getElement().style.backgroundColor = "rgba(255, 0, 0, 0.15)";
+                    }} else if (p <= 3) {{
+                        row.getElement().style.backgroundColor = "rgba(255, 100, 0, 0.1)";
+                    }} else if (p <= 4) {{
+                        row.getElement().style.backgroundColor = "rgba(255, 200, 0, 0.05)";
+                    }}
+                }},
+            }});
         }}
     </script>
 </body>
