@@ -522,6 +522,83 @@ async fn search_ui(
         })
         .unwrap_or_default();
 
+    // Build histogram queries for both minute and hour granularity
+    let mut hist_where = format!(
+        "FROM journal_logs WHERE timestamp >= '{}' AND timestamp < '{}'",
+        start.to_rfc3339(),
+        end.to_rfc3339()
+    );
+
+    if let Some(ref q) = params.q
+        && !q.is_empty()
+    {
+        let escaped = escape_like(q);
+        hist_where.push_str(&format!(" AND message ILIKE '%{}%' ESCAPE '\\'", escaped));
+    }
+    if let Some(ref hostname) = params.hostname
+        && !hostname.is_empty()
+    {
+        let hosts: Vec<&str> = hostname.split(',').collect();
+        let host_list: Vec<String> = hosts
+            .iter()
+            .map(|h| format!("'{}'", h.replace('\'', "''")))
+            .collect();
+        hist_where.push_str(&format!(" AND _hostname IN ({})", host_list.join(",")));
+    }
+    if let Some(ref unit) = params.unit
+        && !unit.is_empty()
+    {
+        let units: Vec<&str> = unit.split(',').collect();
+        let unit_list: Vec<String> = units
+            .iter()
+            .map(|u| format!("'{}'", u.replace('\'', "''")))
+            .collect();
+        hist_where.push_str(&format!(
+            " AND _systemd_unit IN ({})",
+            unit_list.join(",")
+        ));
+    }
+    if let Some(priority) = params.priority {
+        hist_where.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
+    }
+
+    let mut histogram_both: serde_json::Map<String, serde_json::Value> =
+        serde_json::Map::new();
+
+    for bin_unit in &["minute", "hour"] {
+        let hist_sql = format!(
+            "SELECT CAST(date_trunc('{}', timestamp) AS VARCHAR) as bin, COUNT(*) as count {} GROUP BY bin ORDER BY bin",
+            bin_unit, hist_where
+        );
+
+        let rows: Vec<serde_json::Value> = conn
+            .prepare(&hist_sql)
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "bin": row.get::<_, String>(0)?,
+                        "count": row.get::<_, i64>(1)?,
+                    }))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        histogram_both.insert(bin_unit.to_string(), serde_json::Value::Array(rows));
+    }
+
+    let histogram_json = serde_json::to_string(&histogram_both)
+        .unwrap_or_else(|_| "{}".to_string())
+        .replace("</", "<\\/");
+
+    // Pick default bin unit based on range
+    let range_seconds = (end - start).num_seconds();
+    let default_bin = if range_seconds <= 7200 {
+        "minute"
+    } else {
+        "hour"
+    };
+
     // Get filter options
     let hostnames: Vec<String> = conn
         .prepare("SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname")
@@ -540,17 +617,34 @@ async fn search_ui(
         .unwrap_or_default();
 
     // Build HTML
-    let html = build_search_html(&params, &results, total_count, &hostnames, &units);
+    let start_iso = start.to_rfc3339();
+    let end_iso = end.to_rfc3339();
+    let html = build_search_html(
+        &params,
+        &results,
+        total_count,
+        &hostnames,
+        &units,
+        &histogram_json,
+        default_bin,
+        &start_iso,
+        &end_iso,
+    );
 
     Html(html)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_search_html(
     params: &SearchParams,
     results: &[SearchResult],
     total_count: usize,
     hostnames: &[String],
     units: &[String],
+    histogram_json: &str,
+    bin_unit: &str,
+    start_iso: &str,
+    end_iso: &str,
 ) -> String {
     let query_value = params.q.as_deref().unwrap_or("");
     let hostname_value = params.hostname.as_deref().unwrap_or("");
@@ -693,6 +787,7 @@ fn build_search_html(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
     <link href="https://unpkg.com/tabulator-tables@6.3.1/dist/css/tabulator_midnight.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
     <style>
         * {{
             box-sizing: border-box;
@@ -917,6 +1012,36 @@ fn build_search_html(
                 flex-wrap: wrap;
             }}
         }}
+        #timechart-container {{
+            background-color: #16213e;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            max-height: 250px;
+        }}
+        #timechart-container canvas {{
+            max-height: 200px;
+        }}
+        #bin-toggle {{
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 8px;
+        }}
+        .bin-btn {{
+            background-color: #0f3460;
+            color: #00d9ff;
+            border: 1px solid #00d9ff;
+            padding: 4px 14px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .bin-btn:hover, .bin-btn.active {{
+            background-color: #00d9ff;
+            color: #1a1a2e;
+        }}
         #results-table {{
             height: 600px;
             background-color: #16213e;
@@ -1011,6 +1136,14 @@ fn build_search_html(
 
         {}
 
+        <div id="timechart-container">
+            <canvas id="timechart"></canvas>
+            <div id="bin-toggle">
+                <button type="button" class="bin-btn" data-bin="minute">Minutes</button>
+                <button type="button" class="bin-btn" data-bin="hour">Hours</button>
+            </div>
+        </div>
+
         <div id="results-table"></div>
 
         {}
@@ -1018,6 +1151,136 @@ fn build_search_html(
 
     <script type="application/json" id="results-data">
         {}
+    </script>
+
+    <script type="application/json" id="histogram-data"
+            data-start="{}" data-end="{}" data-default-bin="{}">
+        {}
+    </script>
+
+    <script>
+        // Initialize timechart
+        (function() {{
+            const histEl = document.getElementById('histogram-data');
+            const rangeStart = new Date(histEl.dataset.start);
+            const rangeEnd = new Date(histEl.dataset.end);
+            const defaultBin = histEl.dataset.defaultBin;
+            let allHist = {{}};
+            if (histEl && histEl.textContent.trim()) {{
+                try {{ allHist = JSON.parse(histEl.textContent); }} catch(e) {{}}
+            }}
+
+            const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+            function toKey(dt) {{
+                return dt.getUTCFullYear() + '-' +
+                    String(dt.getUTCMonth()+1).padStart(2,'0') + '-' +
+                    String(dt.getUTCDate()).padStart(2,'0') + ' ' +
+                    String(dt.getUTCHours()).padStart(2,'0') + ':' +
+                    String(dt.getUTCMinutes()).padStart(2,'0') + ':' +
+                    String(dt.getUTCSeconds()).padStart(2,'0');
+            }}
+
+            function truncate(dt, unit) {{
+                const d = new Date(dt);
+                if (unit === 'minute') {{
+                    d.setUTCSeconds(0, 0);
+                }} else {{
+                    d.setUTCMinutes(0, 0, 0);
+                }}
+                return d;
+            }}
+
+            function formatLabel(dt, unit) {{
+                if (unit === 'minute') {{
+                    return String(dt.getUTCHours()).padStart(2,'0') + ':' +
+                           String(dt.getUTCMinutes()).padStart(2,'0');
+                }} else {{
+                    return months[dt.getUTCMonth()] + ' ' + dt.getUTCDate() + ' ' +
+                           String(dt.getUTCHours()).padStart(2,'0') + ':00';
+                }}
+            }}
+
+            function buildSeries(unit) {{
+                const histData = allHist[unit] || [];
+                const countMap = {{}};
+                histData.forEach(d => {{ countMap[d.bin] = d.count; }});
+                const binMs = unit === 'minute' ? 60000 : 3600000;
+                const labels = [];
+                const counts = [];
+                let cur = truncate(rangeStart, unit);
+                const endT = rangeEnd.getTime();
+                while (cur.getTime() <= endT) {{
+                    labels.push(formatLabel(cur, unit));
+                    counts.push(countMap[toKey(cur)] || 0);
+                    cur = new Date(cur.getTime() + binMs);
+                }}
+                return {{ labels, counts }};
+            }}
+
+            const container = document.getElementById('timechart-container');
+            let chart = null;
+
+            function renderChart(unit) {{
+                const series = buildSeries(unit);
+                if (series.labels.length === 0) {{
+                    container.style.display = 'none';
+                    return;
+                }}
+                container.style.display = '';
+
+                // Update active button
+                document.querySelectorAll('.bin-btn').forEach(b => {{
+                    b.classList.toggle('active', b.dataset.bin === unit);
+                }});
+
+                if (chart) {{
+                    chart.data.labels = series.labels;
+                    chart.data.datasets[0].data = series.counts;
+                    chart.update();
+                }} else {{
+                    chart = new Chart(document.getElementById('timechart'), {{
+                        type: 'bar',
+                        data: {{
+                            labels: series.labels,
+                            datasets: [{{
+                                label: 'Events',
+                                data: series.counts,
+                                backgroundColor: 'rgba(0, 217, 255, 0.7)',
+                                borderColor: 'rgba(0, 217, 255, 1)',
+                                borderWidth: 1,
+                            }}]
+                        }},
+                        options: {{
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {{
+                                legend: {{ display: false }},
+                            }},
+                            scales: {{
+                                x: {{
+                                    ticks: {{ color: '#888', maxRotation: 45, maxTicksLimit: 30 }},
+                                    grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                                }},
+                                y: {{
+                                    beginAtZero: true,
+                                    ticks: {{ color: '#888' }},
+                                    grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                                }}
+                            }}
+                        }}
+                    }});
+                }}
+            }}
+
+            // Bind toggle buttons
+            document.querySelectorAll('.bin-btn').forEach(btn => {{
+                btn.addEventListener('click', () => renderChart(btn.dataset.bin));
+            }});
+
+            // Initial render
+            renderChart(defaultBin);
+        }})();
     </script>
 
     <script type="module">
@@ -1093,6 +1356,10 @@ fn build_search_html(
         },
         pagination,
         results_json,
+        start_iso,
+        end_iso,
+        bin_unit,
+        histogram_json,
     )
 }
 
