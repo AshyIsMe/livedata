@@ -225,17 +225,6 @@ impl JournalLogReader {
             match self.journal.previous_entry() {
                 Ok(Some(entry)) => {
                     if let Ok(log_entry) = self.convert_journal_entry(&entry) {
-                        // Print all fields on a single line
-                        let fields_vec: Vec<String> = log_entry
-                            .fields
-                            .iter()
-                            .map(|(k, v)| format!("{}={}", k, v))
-                            .collect();
-                        info!(
-                            "Journal Entry {} {}",
-                            log_entry.timestamp,
-                            fields_vec.join(" ")
-                        );
 
                         if log_entry.timestamp >= cutoff_timestamp
                             && log_entry.timestamp <= Utc::now()
