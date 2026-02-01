@@ -116,16 +116,16 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PROCE-01 | Phase 1 | Pending |
 | PROCE-02 | Phase 1 | Pending |
 | PROCE-03 | Phase 1 | Pending |
-| STOR-02 | Phase 1 | Pending |
-| STOR-03 | Phase 1 | Pending |
-| DEPL-02 | Phase 1 | Pending |
+| STOR-02 | Phase 2 | Pending |
+| STOR-03 | Phase 2 | Pending |
+| DEPL-02 | Phase 3 | Pending |
 
 **Coverage:**
-- Active requirements: 4 total
+- Active requirements: 6 total
 - Validated requirements: 7 complete
-- Mapped to phases: 0
-- Unmapped: 4 ⚠️
+- Mapped to phases: 6/6 ✓
+- Unmapped: 0
 
 ---
 *Requirements defined: 2025-02-01*
-*Last updated: 2025-02-01 after initial definition*
+*Last updated: 2026-02-02 after roadmap creation*
