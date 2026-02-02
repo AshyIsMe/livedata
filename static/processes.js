@@ -9,18 +9,47 @@ let autoRefreshInterval;
 
 // Initialize on DOMContentLoaded
 document.addEventListener('DOMContentLoaded', () => {
-    initializeTable();
-    initializeControls();
-    fetchProcesses();
+    console.log('[ProcessMonitor] DOM loaded, starting initialization...');
+    
+    // Check if Tabulator is available
+    if (typeof Tabulator === 'undefined') {
+        console.error('[ProcessMonitor] Tabulator library not loaded!');
+        showError('Failed to load Tabulator table library. Please refresh the page.');
+        return;
+    }
+    
+    console.log('[ProcessMonitor] Tabulator version:', Tabulator.prototype.version);
+    
+    // Check if table container exists
+    const tableContainer = document.getElementById('processes-table');
+    if (!tableContainer) {
+        console.error('[ProcessMonitor] Table container #processes-table not found!');
+        showError('Table container not found. Please refresh the page.');
+        return;
+    }
+    
+    try {
+        initializeTable();
+        initializeControls();
+        fetchProcesses();
+        console.log('[ProcessMonitor] Initialization complete');
+    } catch (error) {
+        console.error('[ProcessMonitor] Initialization failed:', error);
+        showError('Failed to initialize process monitor: ' + error.message);
+    }
 });
 
 /**
  * Initialize the Tabulator table with process columns
  */
 function initializeTable() {
+    console.log('[ProcessMonitor] Initializing Tabulator table...');
+    
     table = new Tabulator("#processes-table", {
         layout: "fitColumns",
         initialSort: [{ column: "cpu_percent", dir: "desc" }],
+        placeholder: "No processes found",
+        data: [], // Start with empty data
         columns: [
             { 
                 title: "PID", 
@@ -38,7 +67,10 @@ function initializeTable() {
                 title: "CPU %", 
                 field: "cpu_percent", 
                 sorter: "number",
-                formatter: (cell) => cell.getValue().toFixed(1) + "%",
+                formatter: (cell) => {
+                    const val = cell.getValue();
+                    return val !== null && val !== undefined ? val.toFixed(1) + "%" : "-";
+                },
                 width: 120,
                 hozAlign: "right"
             },
@@ -46,7 +78,10 @@ function initializeTable() {
                 title: "Memory %", 
                 field: "memory_percent", 
                 sorter: "number",
-                formatter: (cell) => cell.getValue().toFixed(1) + "%",
+                formatter: (cell) => {
+                    const val = cell.getValue();
+                    return val !== null && val !== undefined ? val.toFixed(1) + "%" : "-";
+                },
                 width: 120,
                 hozAlign: "right"
             },
@@ -55,7 +90,13 @@ function initializeTable() {
                 field: "user_id", 
                 sorter: "string",
                 width: 150,
-                formatter: (cell) => cell.getValue() || "-"
+                formatter: (cell) => {
+                    const val = cell.getValue();
+                    if (!val) return "-";
+                    // Extract numeric UID from "Uid(1234)" format
+                    const match = String(val).match(/Uid\((\d+)\)/);
+                    return match ? match[1] : val;
+                }
             },
             { 
                 title: "Runtime", 
@@ -65,39 +106,59 @@ function initializeTable() {
             }
         ]
     });
+    
+    console.log('[ProcessMonitor] Table initialized successfully');
 }
 
 /**
  * Set up event listeners for controls
  */
 function initializeControls() {
+    console.log('[ProcessMonitor] Initializing controls...');
+    
     // Search input with debouncing
-    document.getElementById('search-input').addEventListener('input', (e) => {
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-            filterAndDisplay();
-        }, DEBOUNCE_MS);
-    });
+    const searchInput = document.getElementById('search-input');
+    if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                filterAndDisplay();
+            }, DEBOUNCE_MS);
+        });
+    }
     
     // Manual refresh button
-    document.getElementById('refresh-button').addEventListener('click', () => {
-        fetchProcesses();
-    });
+    const refreshButton = document.getElementById('refresh-button');
+    if (refreshButton) {
+        refreshButton.addEventListener('click', () => {
+            console.log('[ProcessMonitor] Manual refresh triggered');
+            fetchProcesses();
+        });
+    }
     
     // Auto-refresh toggle
-    document.getElementById('auto-refresh').addEventListener('change', updateAutoRefresh);
+    const autoRefreshCheckbox = document.getElementById('auto-refresh');
+    if (autoRefreshCheckbox) {
+        autoRefreshCheckbox.addEventListener('change', updateAutoRefresh);
+    }
     
     // Refresh interval change
-    document.getElementById('refresh-interval').addEventListener('change', updateAutoRefresh);
+    const refreshInterval = document.getElementById('refresh-interval');
+    if (refreshInterval) {
+        refreshInterval.addEventListener('change', updateAutoRefresh);
+    }
     
     // Start auto-refresh
     updateAutoRefresh();
+    console.log('[ProcessMonitor] Controls initialized');
 }
 
 /**
  * Fetch process data from the API
  */
 async function fetchProcesses() {
+    console.log('[ProcessMonitor] Fetching process data...');
+    
     try {
         const response = await fetch('/api/processes');
         
@@ -106,6 +167,11 @@ async function fetchProcesses() {
         }
         
         const data = await response.json();
+        console.log(`[ProcessMonitor] Received ${data.processes ? data.processes.length : 0} processes`);
+        
+        if (!data.processes || !Array.isArray(data.processes)) {
+            throw new Error('Invalid data format: processes array not found');
+        }
         
         // Process data - calculate derived fields
         allProcesses = data.processes.map(proc => {
@@ -119,6 +185,8 @@ async function fetchProcesses() {
             };
         });
         
+        console.log(`[ProcessMonitor] Processed ${allProcesses.length} processes for display`);
+        
         // Update table with filtered data
         filterAndDisplay();
         
@@ -126,8 +194,8 @@ async function fetchProcesses() {
         updateTimestamp(data.timestamp);
         
     } catch (error) {
-        console.error('Failed to fetch processes:', error);
-        showError('Failed to fetch process data. Please try again.');
+        console.error('[ProcessMonitor] Failed to fetch processes:', error);
+        showError('Failed to fetch process data: ' + error.message);
     }
 }
 
@@ -136,6 +204,7 @@ async function fetchProcesses() {
  * Assumes 16GB total memory (to be replaced with actual system memory API)
  */
 function calculateMemoryPercent(memoryBytes) {
+    if (!memoryBytes || memoryBytes === 0) return 0;
     const totalMemoryBytes = 16 * 1024 * 1024 * 1024; // 16GB in bytes
     return (memoryBytes / totalMemoryBytes) * 100;
 }
@@ -145,6 +214,8 @@ function calculateMemoryPercent(memoryBytes) {
  * Examples: "45s", "5m 30s", "2h 15m", "3d 12h"
  */
 function formatRuntime(seconds) {
+    if (!seconds || seconds < 0) return "-";
+    
     if (seconds < 60) {
         return seconds + "s";
     }
@@ -170,19 +241,28 @@ function formatRuntime(seconds) {
  * Filter processes based on search query and update table
  */
 function filterAndDisplay() {
+    if (!table) {
+        console.error('[ProcessMonitor] Table not initialized in filterAndDisplay');
+        return;
+    }
+    
     const query = document.getElementById('search-input').value.toLowerCase().trim();
     
+    console.log(`[ProcessMonitor] Filtering with query: "${query}"`);
+    
     if (!query) {
+        console.log(`[ProcessMonitor] Setting ${allProcesses.length} processes (no filter)`);
         table.setData(allProcesses);
         return;
     }
     
     // Fuzzy-ish filter: all query chars must appear in order in searchable text
     const filtered = allProcesses.filter(proc => {
-        const searchText = `${proc.pid} ${proc.name} ${proc.user_id || ''} ${proc.cpu_percent.toFixed(1)}`.toLowerCase();
+        const searchText = `${proc.pid} ${proc.name} ${proc.user_id || ''} ${proc.cpu_percent !== undefined ? proc.cpu_percent.toFixed(1) : ''}`.toLowerCase();
         return fuzzyMatch(query, searchText);
     });
     
+    console.log(`[ProcessMonitor] Filtered to ${filtered.length} processes`);
     table.setData(filtered);
 }
 
@@ -218,6 +298,9 @@ function updateAutoRefresh() {
     
     if (enabled && intervalSecs > 0) {
         autoRefreshInterval = setInterval(fetchProcesses, intervalSecs * 1000);
+        console.log(`[ProcessMonitor] Auto-refresh enabled: ${intervalSecs}s interval`);
+    } else {
+        console.log('[ProcessMonitor] Auto-refresh disabled');
     }
 }
 
@@ -225,18 +308,37 @@ function updateAutoRefresh() {
  * Update the "last updated" timestamp display
  */
 function updateTimestamp(isoTimestamp) {
+    if (!isoTimestamp) return;
+    
     const date = new Date(isoTimestamp);
     const secondsAgo = Math.floor((Date.now() - date.getTime()) / 1000);
     const timeString = date.toLocaleTimeString();
     
-    document.getElementById('last-updated').textContent = 
-        `Updated ${secondsAgo}s ago (${timeString})`;
+    const element = document.getElementById('last-updated');
+    if (element) {
+        element.textContent = `Updated ${secondsAgo}s ago (${timeString})`;
+    }
 }
 
 /**
  * Display error message to user
  */
 function showError(message) {
-    // Could add a toast notification here
-    console.error(message);
+    console.error('[ProcessMonitor]', message);
+    
+    // Create or update error display
+    let errorDiv = document.getElementById('process-error-message');
+    if (!errorDiv) {
+        errorDiv = document.createElement('div');
+        errorDiv.id = 'process-error-message';
+        errorDiv.style.cssText = 'background: #ffebee; color: #c62828; padding: 15px; margin: 20px 0; border-radius: 4px; border: 1px solid #ef9a9a;';
+        
+        const tableContainer = document.getElementById('processes-table');
+        if (tableContainer && tableContainer.parentNode) {
+            tableContainer.parentNode.insertBefore(errorDiv, tableContainer);
+        }
+    }
+    
+    errorDiv.textContent = message;
+    errorDiv.style.display = 'block';
 }
