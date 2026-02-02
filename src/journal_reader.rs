@@ -225,7 +225,6 @@ impl JournalLogReader {
             match self.journal.previous_entry() {
                 Ok(Some(entry)) => {
                     if let Ok(log_entry) = self.convert_journal_entry(&entry) {
-
                         if log_entry.timestamp >= cutoff_timestamp
                             && log_entry.timestamp <= Utc::now()
                         {

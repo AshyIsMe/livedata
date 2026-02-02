@@ -129,9 +129,7 @@ impl ApplicationController {
         self.buffer.conn.execute("BEGIN TRANSACTION", [])?;
         let result = self
             .journal_reader
-            .process_historical_entries(cutoff_time, |entry| {
-                self.buffer.add_entry(entry)
-            });
+            .process_historical_entries(cutoff_time, |entry| self.buffer.add_entry(entry));
         match result {
             Ok(count) => {
                 self.buffer.conn.execute("COMMIT", [])?;
