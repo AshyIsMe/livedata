@@ -26,12 +26,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. User can view list of running processes with PID, name, CPU %, memory %, user, and runtime in the web interface
   2. User can search/filter processes using fuzzy search (fzf-style) in the web interface
   3. Process data is collected at user-configurable intervals via CLI flag or config file
-**Plans**: TBD
+**Plans**: 4 plans
 
 Plans:
-- [ ] 01-01: Process collection backend using sysinfo crate
-- [ ] 01-02: Web interface for process listing and search
-- [ ] 01-03: Configurable collection interval integration
+- [ ] 01-01-PLAN.md — Backend process collection with sysinfo and API endpoint
+- [ ] 01-02-PLAN.md — CLI integration and ApplicationController wiring
+- [ ] 01-03-PLAN.md — Frontend process table with search and auto-refresh
+- [ ] 01-04-PLAN.md — End-to-end verification checkpoint
 
 ### Phase 2: Storage Enhancements
 **Goal**: Users can control data retention and schema changes
@@ -70,6 +71,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Process Monitoring Core | 0/TBD | Not started | - |
+| 1. Process Monitoring Core | 0/4 | Not started | - |
 | 2. Storage Enhancements | 0/TBD | Not started | - |
 | 3. Zero-Config Improvements | 0/TBD | Not started | - |
