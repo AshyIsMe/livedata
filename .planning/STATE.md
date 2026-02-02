@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-01)
 ## Current Position
 
 Phase: 1 of 3 (Process Monitoring Core)
-Plan: TBD in current phase
-Status: Ready to plan
-Last activity: 2026-02-02 — Roadmap created, ready to begin Phase 1 planning
+Plan: 1 of 4 in current phase
+Status: In progress
+Last activity: 2026-02-02 — Completed 01-01-PLAN.md
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 8%
 
 ## Performance Metrics
 
@@ -42,7 +42,11 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- None yet (roadmap just created)
+| Phase | Decision | Rationale |
+|-------|----------|-----------|
+| 01-01 | sysinfo 0.38 API uses bool for refresh_processes | API differs from research, adapted to actual crate version |
+| 01-01 | In-memory process data for Phase 1 | Follows plan; DuckDB storage deferred to later phase if needed |
+| 01-01 | 5-second refresh interval | Balance between accuracy and system overhead |
 
 ### Pending Todos
 
@@ -58,6 +62,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-02 (initial session)
-Stopped at: Roadmap creation completed, files written
+Last session: 2026-02-02 13:21 UTC
+Stopped at: Completed 01-01-PLAN.md (backend process collection)
 Resume file: None
