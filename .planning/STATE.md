@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-02-01)
 ## Current Position
 
 Phase: 1 of 3 (Process Monitoring Core)
-Plan: 1 of 4 in current phase
+Plan: 2 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-02 — Completed 01-01-PLAN.md
+Last activity: 2026-02-02 — Completed 01-02-PLAN.md
 
-Progress: [█░░░░░░░░░] 8%
+Progress: [██░░░░░░░░] 17%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: - min
-- Total execution time: 0 hours
+- Total plans completed: 2
+- Average duration: 6 min
+- Total execution time: 0.2 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 1 | 2 | 12 min | 6 min |
 
 **Recent Trend:**
-- Last 5 plans: N/A
-- Trend: N/A
+- Last 5 plans: 2 completed
+- Trend: Accelerating
 
 *Updated after each plan completion*
 
@@ -47,6 +47,8 @@ Recent decisions affecting current work:
 | 01-01 | sysinfo 0.38 API uses bool for refresh_processes | API differs from research, adapted to actual crate version |
 | 01-01 | In-memory process data for Phase 1 | Follows plan; DuckDB storage deferred to later phase if needed |
 | 01-01 | 5-second refresh interval | Balance between accuracy and system overhead |
+| 01-02 | ProcessMonitor lifecycle managed by ApplicationController | Better encapsulation, main.rs simplified |
+| 01-02 | Tests use #[tokio::test] for ProcessMonitor compatibility | ProcessMonitor spawns async tasks requiring tokio runtime |
 
 ### Pending Todos
 
@@ -62,6 +64,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-02 13:21 UTC
-Stopped at: Completed 01-01-PLAN.md (backend process collection)
+Last session: 2026-02-02 13:30 UTC
+Stopped at: Completed 01-02-PLAN.md (CLI integration and ApplicationController wiring)
 Resume file: None
