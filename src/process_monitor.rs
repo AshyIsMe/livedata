@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use sysinfo::{ProcessesToUpdate, System};
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 /// Process information snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]

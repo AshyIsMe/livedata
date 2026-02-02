@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use livedata::app_controller::ApplicationController;
+use livedata::process_monitor::ProcessMonitor;
 use livedata::web_server::run_web_server;
+use std::sync::Arc;
 use std::thread;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -58,11 +60,16 @@ fn main() -> Result<()> {
         // Get shutdown signal to share with web server
         let shutdown_signal = app.get_shutdown_signal();
 
+        // Create process monitor and start background collection
+        let process_monitor = Arc::new(ProcessMonitor::new());
+        process_monitor.start_collection(5); // 5 second refresh interval
+        info!("Process monitoring started with 5-second refresh interval");
+
         // Run the web server in a separate thread
         let data_dir = args.data_dir.clone();
         let web_server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_web_server(&data_dir, shutdown_signal));
+            rt.block_on(run_web_server(&data_dir, shutdown_signal, process_monitor));
         });
 
         app.run(args.follow)?;

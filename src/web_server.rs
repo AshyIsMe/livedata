@@ -1,3 +1,4 @@
+use crate::process_monitor::{ProcessInfo, ProcessMonitor};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -16,16 +17,21 @@ use std::sync::{Arc, Mutex};
 pub struct AppState {
     pub data_dir: String,
     pub conn: Mutex<Connection>,
+    pub process_monitor: Arc<ProcessMonitor>,
 }
 
 impl AppState {
-    pub fn new(data_dir: &str) -> Result<Self, duckdb::Error> {
+    pub fn new(
+        data_dir: &str,
+        process_monitor: Arc<ProcessMonitor>,
+    ) -> Result<Self, duckdb::Error> {
         // Connect to the on-disk DuckDB database
         let db_path = std::path::Path::new(data_dir).join("livedata.duckdb");
         let conn = Connection::open(&db_path)?;
         Ok(Self {
             data_dir: data_dir.to_string(),
             conn: Mutex::new(conn),
+            process_monitor,
         })
     }
 }
@@ -154,6 +160,14 @@ pub struct HealthResponse {
     pub data_dir: String,
 }
 
+/// Process list API response
+#[derive(Debug, Serialize)]
+pub struct ProcessResponse {
+    pub processes: Vec<ProcessInfo>,
+    pub timestamp: String,
+    pub total: usize,
+}
+
 /// Parse time string (ISO 8601 or relative like -1h, -15m, -7d)
 fn parse_time(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
     if s == "now" {
@@ -217,14 +231,21 @@ fn priority_label(p: u8) -> &'static str {
     }
 }
 
-pub async fn run_web_server(data_dir: &str, shutdown_signal: Arc<AtomicBool>) {
-    let state = Arc::new(AppState::new(data_dir).expect("Failed to create application state"));
+pub async fn run_web_server(
+    data_dir: &str,
+    shutdown_signal: Arc<AtomicBool>,
+    process_monitor: Arc<ProcessMonitor>,
+) {
+    let state = Arc::new(
+        AppState::new(data_dir, process_monitor).expect("Failed to create application state"),
+    );
 
     let app = Router::new()
         .route("/", get(search_ui))
         .route("/api/search", get(api_search))
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
+        .route("/api/processes", get(api_processes))
         .route("/health", get(health))
         .with_state(state);
 
@@ -255,6 +276,20 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         status: "ok".to_string(),
         data_dir: state.data_dir.clone(),
     })
+}
+
+/// API endpoint returning current process snapshot
+async fn api_processes(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProcessResponse>, (StatusCode, String)> {
+    let processes = state.process_monitor.get_snapshot();
+    let total = processes.len();
+
+    Ok(Json(ProcessResponse {
+        processes,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        total,
+    }))
 }
 
 /// Get valid column names from the journal_logs schema
@@ -343,7 +378,10 @@ async fn api_search(
     if schema.is_empty() {
         return Ok(Json(SearchResponse {
             results: Vec::new(),
-            columns: DEFAULT_COLUMNS.iter().map(|c| column_display_name(c)).collect(),
+            columns: DEFAULT_COLUMNS
+                .iter()
+                .map(|c| column_display_name(c))
+                .collect(),
             total: 0,
             limit,
             offset: params.offset,
@@ -364,7 +402,10 @@ async fn api_search(
     }
 
     // Build display names for the response
-    let display_names: Vec<String> = select_exprs.iter().map(|e| column_display_name(e)).collect();
+    let display_names: Vec<String> = select_exprs
+        .iter()
+        .map(|e| column_display_name(e))
+        .collect();
 
     // Build SQL query against the journal_logs table
     let mut sql = format!(
@@ -566,8 +607,7 @@ async fn search_ui(
     } else {
         select_exprs
     };
-    let display_names: Vec<String> =
-        select_list.iter().map(|e| column_display_name(e)).collect();
+    let display_names: Vec<String> = select_list.iter().map(|e| column_display_name(e)).collect();
 
     // Get all available columns for the column chooser
     let all_columns: Vec<ColumnInfo> = schema
@@ -627,7 +667,12 @@ async fn search_ui(
     // Count total results
     let count_sql = format!(
         "SELECT COUNT(*) FROM journal_logs WHERE {}",
-        sql.split("WHERE ").nth(1).unwrap_or("1=1").split(" ORDER BY").next().unwrap_or("1=1")
+        sql.split("WHERE ")
+            .nth(1)
+            .unwrap_or("1=1")
+            .split(" ORDER BY")
+            .next()
+            .unwrap_or("1=1")
     );
 
     // Validate and build ORDER BY clause
@@ -713,17 +758,13 @@ async fn search_ui(
             .iter()
             .map(|u| format!("'{}'", u.replace('\'', "''")))
             .collect();
-        hist_where.push_str(&format!(
-            " AND _systemd_unit IN ({})",
-            unit_list.join(",")
-        ));
+        hist_where.push_str(&format!(" AND _systemd_unit IN ({})", unit_list.join(",")));
     }
     if let Some(priority) = params.priority {
         hist_where.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
     }
 
-    let mut histogram_both: serde_json::Map<String, serde_json::Value> =
-        serde_json::Map::new();
+    let mut histogram_both: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
     for bin_unit in &["minute", "hour"] {
         let hist_sql = format!(
@@ -1670,28 +1711,29 @@ fn build_search_html(
     </script>
 </body>
 </html>"##,
-        html_escape(query_value),            // {0} search input value
-        html_escape(&params.start),            // {1} start time
-        html_escape(&params.end),              // {2} end time
-        hostname_options,                       // {3} hostname options
-        unit_options,                           // {4} unit options
-        priority_options,                       // {5} priority options
-        params.limit.min(100_000),             // {6} limit
+        html_escape(query_value),                // {0} search input value
+        html_escape(&params.start),              // {1} start time
+        html_escape(&params.end),                // {2} end time
+        hostname_options,                        // {3} hostname options
+        unit_options,                            // {4} unit options
+        priority_options,                        // {5} priority options
+        params.limit.min(100_000),               // {6} limit
         params.columns.as_deref().unwrap_or(""), // {7} columns hidden input
-        pagination.clone(),                     // {8} top pagination
-        if results.is_empty() {                // {9} no-results message
+        pagination.clone(),                      // {8} top pagination
+        if results.is_empty() {
+            // {9} no-results message
             "<div class=\"no-results\">No results found. Try adjusting your search or time range.</div>".to_string()
         } else {
             "".to_string()
         },
-        pagination,                             // {10} bottom pagination
-        results_json,                           // {11} results JSON
-        start_iso,                              // {12} histogram start
-        end_iso,                                // {13} histogram end
-        bin_unit,                               // {14} default bin
-        histogram_json,                         // {15} histogram data
-        columns_json,                           // {16} all columns info
-        active_columns_json,                    // {17} active column names
+        pagination,          // {10} bottom pagination
+        results_json,        // {11} results JSON
+        start_iso,           // {12} histogram start
+        end_iso,             // {13} histogram end
+        bin_unit,            // {14} default bin
+        histogram_json,      // {15} histogram data
+        columns_json,        // {16} all columns info
+        active_columns_json, // {17} active column names
     )
 }
 
@@ -1724,12 +1766,16 @@ fn url_encode(s: &str) -> String {
 /// Create router for testing
 #[cfg(test)]
 fn create_test_app(data_dir: &str) -> Router {
-    let state = Arc::new(AppState::new(data_dir).expect("Failed to create test app state"));
+    let process_monitor = Arc::new(ProcessMonitor::new());
+    let state = Arc::new(
+        AppState::new(data_dir, process_monitor).expect("Failed to create test app state"),
+    );
     Router::new()
         .route("/", get(search_ui))
         .route("/api/search", get(api_search))
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
+        .route("/api/processes", get(api_processes))
         .route("/health", get(health))
         .with_state(state)
 }
