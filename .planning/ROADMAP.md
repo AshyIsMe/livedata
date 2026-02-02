@@ -31,7 +31,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 - [x] 01-01-PLAN.md — Backend process collection with sysinfo and API endpoint
 - [x] 01-02-PLAN.md — CLI integration and ApplicationController wiring
-- [ ] 01-03-PLAN.md — Frontend process table with search and auto-refresh
+- [x] 01-03-PLAN.md — Frontend process table with search and auto-refresh
 - [ ] 01-04-PLAN.md — End-to-end verification checkpoint
 
 ### Phase 2: Storage Enhancements
@@ -71,6 +71,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Process Monitoring Core | 2/4 | In progress | 2026-02-02 |
+| 1. Process Monitoring Core | 3/4 | In progress | 2026-02-02 |
 | 2. Storage Enhancements | 0/TBD | Not started | - |
 | 3. Zero-Config Improvements | 0/TBD | Not started | - |
