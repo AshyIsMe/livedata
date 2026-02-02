@@ -39,35 +39,41 @@ impl ProcessMonitor {
     }
 
     /// Start background collection task (run once at startup)
+    /// Spawns a dedicated thread with its own tokio runtime for the collection loop
     pub fn start_collection(&self, interval_secs: u64) {
         let system = self.system.clone();
         let snapshot = self.snapshot.clone();
 
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(interval_secs));
+        std::thread::spawn(move || {
+            // Create a local tokio runtime for this thread
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            
+            rt.block_on(async move {
+                let mut ticker = interval(Duration::from_secs(interval_secs));
 
-            loop {
-                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
 
-                let mut sys = system.lock().unwrap();
-                sys.refresh_processes(ProcessesToUpdate::All, true);
+                    let mut sys = system.lock().unwrap();
+                    sys.refresh_processes(ProcessesToUpdate::All, true);
 
-                // Collect snapshot
-                let processes: Vec<ProcessInfo> = sys
-                    .processes()
-                    .iter()
-                    .map(|(pid, process)| ProcessInfo {
-                        pid: pid.as_u32(),
-                        name: process.name().to_string_lossy().to_string(),
-                        cpu_percent: process.cpu_usage(),
-                        memory_bytes: process.memory(),
-                        user_id: process.user_id().map(|u| format!("{:?}", u)),
-                        runtime_secs: process.run_time(),
-                    })
-                    .collect();
+                    // Collect snapshot
+                    let processes: Vec<ProcessInfo> = sys
+                        .processes()
+                        .iter()
+                        .map(|(pid, process)| ProcessInfo {
+                            pid: pid.as_u32(),
+                            name: process.name().to_string_lossy().to_string(),
+                            cpu_percent: process.cpu_usage(),
+                            memory_bytes: process.memory(),
+                            user_id: process.user_id().map(|u| format!("{:?}", u)),
+                            runtime_secs: process.run_time(),
+                        })
+                        .collect();
 
-                *snapshot.lock().unwrap() = processes;
-            }
+                    *snapshot.lock().unwrap() = processes;
+                }
+            });
         });
     }
 

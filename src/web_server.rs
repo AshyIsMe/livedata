@@ -247,6 +247,10 @@ pub async fn run_web_server(
         .route("/api/filters", get(api_filters))
         .route("/api/processes", get(api_processes))
         .route("/health", get(health))
+        // Static file routes for process monitoring UI
+        .route("/index.html", get(serve_index_html))
+        .route("/processes.html", get(serve_processes_html))
+        .route("/processes.js", get(serve_processes_js))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -276,6 +280,30 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         status: "ok".to_string(),
         data_dir: state.data_dir.clone(),
     })
+}
+
+/// Serve index.html static file
+async fn serve_index_html() -> impl IntoResponse {
+    match tokio::fs::read_to_string("static/index.html").await {
+        Ok(content) => Html(content).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
+    }
+}
+
+/// Serve processes.html static file
+async fn serve_processes_html() -> impl IntoResponse {
+    match tokio::fs::read_to_string("static/processes.html").await {
+        Ok(content) => Html(content).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "processes.html not found").into_response(),
+    }
+}
+
+/// Serve processes.js static file
+async fn serve_processes_js() -> impl IntoResponse {
+    match tokio::fs::read_to_string("static/processes.js").await {
+        Ok(content) => ([("content-type", "application/javascript")], content).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "processes.js not found").into_response(),
+    }
 }
 
 /// API endpoint returning current process snapshot
