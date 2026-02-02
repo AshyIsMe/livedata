@@ -1,9 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use livedata::app_controller::ApplicationController;
-use livedata::process_monitor::ProcessMonitor;
 use livedata::web_server::run_web_server;
-use std::sync::Arc;
 use std::thread;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -20,6 +18,10 @@ struct Args {
     /// Follow mode: don't process historical data, just start following from now
     #[arg(short = 'f', long)]
     follow: bool,
+
+    /// Process collection interval in seconds
+    #[arg(short = 'p', long, default_value = "5")]
+    process_interval: u64,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -55,15 +57,13 @@ fn main() -> Result<()> {
     // Check if the web subcommand is present
     if let Some(Commands::Web) = args.command {
         // Create and run the application in the main thread
-        let mut app = ApplicationController::new(&args.data_dir)?;
+        let mut app = ApplicationController::new(&args.data_dir, args.process_interval)?;
 
         // Get shutdown signal to share with web server
         let shutdown_signal = app.get_shutdown_signal();
 
-        // Create process monitor and start background collection
-        let process_monitor = Arc::new(ProcessMonitor::new());
-        process_monitor.start_collection(5); // 5 second refresh interval
-        info!("Process monitoring started with 5-second refresh interval");
+        // Get process monitor from app BEFORE moving app
+        let process_monitor = app.get_process_monitor();
 
         // Run the web server in a separate thread
         let data_dir = args.data_dir.clone();
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         web_server_handle.join().unwrap();
     } else {
         // Create and run the application in the main thread
-        let mut app = ApplicationController::new(&args.data_dir)?;
+        let mut app = ApplicationController::new(&args.data_dir, args.process_interval)?;
         app.run(args.follow)?;
     }
 

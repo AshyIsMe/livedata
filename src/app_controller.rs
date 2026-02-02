@@ -1,14 +1,15 @@
 use crate::duckdb_buffer::DuckDBBuffer;
 use crate::journal_reader::JournalLogReader;
 use crate::log_entry::LogEntry;
+use crate::process_monitor::ProcessMonitor;
 use anyhow::Result;
 use chrono::{TimeDelta, Utc};
 use gethostname::gethostname;
 use log::{error, info, warn};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -17,16 +18,24 @@ pub struct ApplicationController {
     buffer: DuckDBBuffer,
     hostname: String,
     shutdown_signal: Arc<AtomicBool>,
+    process_monitor: Arc<ProcessMonitor>,
 }
 
 impl ApplicationController {
-    pub fn new<P: AsRef<std::path::Path>>(data_dir: P) -> Result<Self> {
+    pub fn new<P: AsRef<std::path::Path>>(data_dir: P, process_interval: u64) -> Result<Self> {
         info!("Initializing Application Controller");
 
         let journal_reader = JournalLogReader::new()?;
         let buffer = DuckDBBuffer::new(data_dir)?;
         let hostname = gethostname().to_str().unwrap_or("unknown").to_string();
         let shutdown_signal = Arc::new(AtomicBool::new(false));
+
+        let process_monitor = Arc::new(ProcessMonitor::new());
+        process_monitor.start_collection(process_interval);
+        info!(
+            "Started process monitoring with {}s interval",
+            process_interval
+        );
 
         info!("Application Controller initialized successfully");
         info!("Using on-disk DuckDB at: {}", buffer.db_path().display());
@@ -36,11 +45,16 @@ impl ApplicationController {
             buffer,
             hostname,
             shutdown_signal,
+            process_monitor,
         })
     }
 
     pub fn get_shutdown_signal(&self) -> Arc<AtomicBool> {
         self.shutdown_signal.clone()
+    }
+
+    pub fn get_process_monitor(&self) -> Arc<ProcessMonitor> {
+        self.process_monitor.clone()
     }
 
     pub fn setup_signal_handler(&self) -> Result<()> {
@@ -254,17 +268,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_application_controller_creation() {
+    #[tokio::test]
+    async fn test_application_controller_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let result = ApplicationController::new(temp_dir.path());
+        let result = ApplicationController::new(temp_dir.path(), 5);
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_status_retrieval() {
+    #[tokio::test]
+    async fn test_status_retrieval() {
         let temp_dir = TempDir::new().unwrap();
-        let mut controller = ApplicationController::new(temp_dir.path()).unwrap();
+        let mut controller = ApplicationController::new(temp_dir.path(), 5).unwrap();
 
         let status = controller.get_status().unwrap();
         assert_eq!(status.total_entries, 0);
