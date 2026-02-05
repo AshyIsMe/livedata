@@ -93,6 +93,7 @@ fn main() -> Result<()> {
 
     // Check if the web subcommand is present
     if let Some(Commands::Web) = args.command {
+        let settings_for_web = settings.clone();
         // Create and run the application in the main thread
         let mut app = ApplicationController::new(&args.data_dir, args.process_interval, settings)?;
 
@@ -106,7 +107,7 @@ fn main() -> Result<()> {
         let data_dir = args.data_dir.clone();
         let web_server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_web_server(&data_dir, shutdown_signal, process_monitor));
+            rt.block_on(run_web_server(&data_dir, shutdown_signal, process_monitor, settings_for_web));
         });
 
         app.run(args.follow)?;

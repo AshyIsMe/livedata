@@ -1,3 +1,4 @@
+use crate::config::Settings;
 use crate::process_monitor::{ProcessInfo, ProcessMonitor};
 use axum::{
     Json, Router,
@@ -18,12 +19,14 @@ pub struct AppState {
     pub data_dir: String,
     pub conn: Mutex<Connection>,
     pub process_monitor: Arc<ProcessMonitor>,
+    pub settings: Settings,
 }
 
 impl AppState {
     pub fn new(
         data_dir: &str,
         process_monitor: Arc<ProcessMonitor>,
+        settings: Settings,
     ) -> Result<Self, duckdb::Error> {
         // Connect to the on-disk DuckDB database
         let db_path = std::path::Path::new(data_dir).join("livedata.duckdb");
@@ -32,6 +35,7 @@ impl AppState {
             data_dir: data_dir.to_string(),
             conn: Mutex::new(conn),
             process_monitor,
+            settings,
         })
     }
 }
@@ -168,6 +172,25 @@ pub struct ProcessResponse {
     pub total: usize,
 }
 
+/// Storage health API response
+#[derive(Debug, Serialize)]
+pub struct StorageHealthResponse {
+    pub database_size_bytes: u64,
+    pub journal_log_count: i64,
+    pub process_metric_count: i64,
+    pub oldest_log_timestamp: Option<String>,
+    pub newest_log_timestamp: Option<String>,
+    pub retention_policy: RetentionPolicy,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetentionPolicy {
+    pub log_retention_days: u32,
+    pub log_max_size_gb: f64,
+    pub process_retention_days: u32,
+    pub process_max_size_gb: f64,
+}
+
 /// Parse time string (ISO 8601 or relative like -1h, -15m, -7d)
 fn parse_time(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
     if s == "now" {
@@ -235,9 +258,10 @@ pub async fn run_web_server(
     data_dir: &str,
     shutdown_signal: Arc<AtomicBool>,
     process_monitor: Arc<ProcessMonitor>,
+    settings: Settings,
 ) {
     let state = Arc::new(
-        AppState::new(data_dir, process_monitor).expect("Failed to create application state"),
+        AppState::new(data_dir, process_monitor, settings).expect("Failed to create application state"),
     );
 
     let app = Router::new()
@@ -246,6 +270,7 @@ pub async fn run_web_server(
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/api/processes", get(api_processes))
+        .route("/api/storage/health", get(api_storage_health))
         .route("/health", get(health))
         // Static file routes for process monitoring UI
         .route("/index.html", get(serve_index_html))
@@ -317,6 +342,59 @@ async fn api_processes(
         processes,
         timestamp: chrono::Utc::now().to_rfc3339(),
         total,
+    }))
+}
+
+/// API endpoint returning storage health and statistics
+async fn api_storage_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<StorageHealthResponse>, (StatusCode, String)> {
+    let conn = state.conn.lock().unwrap();
+
+    // Get database file size
+    let db_path = std::path::Path::new(&state.data_dir).join("livedata.duckdb");
+    let database_size_bytes = std::fs::metadata(&db_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Get journal log count
+    let journal_log_count: i64 = conn
+        .prepare("SELECT COUNT(*) FROM journal_logs")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+        .unwrap_or(0);
+
+    // Get process metric count
+    let process_metric_count: i64 = conn
+        .prepare("SELECT COUNT(*) FROM process_metrics")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+        .unwrap_or(0);
+
+    // Get oldest log timestamp
+    let oldest_log_timestamp: Option<String> = conn
+        .prepare("SELECT MIN(timestamp) FROM journal_logs")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+        .ok();
+
+    // Get newest log timestamp
+    let newest_log_timestamp: Option<String> = conn
+        .prepare("SELECT MAX(timestamp) FROM journal_logs")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+        .ok();
+
+    let retention_policy = RetentionPolicy {
+        log_retention_days: state.settings.log_retention_days,
+        log_max_size_gb: state.settings.log_max_size_gb,
+        process_retention_days: state.settings.process_retention_days,
+        process_max_size_gb: state.settings.process_max_size_gb,
+    };
+
+    Ok(Json(StorageHealthResponse {
+        database_size_bytes,
+        journal_log_count,
+        process_metric_count,
+        oldest_log_timestamp,
+        newest_log_timestamp,
+        retention_policy,
     }))
 }
 
@@ -1795,8 +1873,9 @@ fn url_encode(s: &str) -> String {
 #[cfg(test)]
 fn create_test_app(data_dir: &str) -> Router {
     let process_monitor = Arc::new(ProcessMonitor::new());
+    let settings = Settings::default();
     let state = Arc::new(
-        AppState::new(data_dir, process_monitor).expect("Failed to create test app state"),
+        AppState::new(data_dir, process_monitor, settings).expect("Failed to create test app state"),
     );
     Router::new()
         .route("/", get(search_ui))
@@ -1804,6 +1883,7 @@ fn create_test_app(data_dir: &str) -> Router {
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/api/processes", get(api_processes))
+        .route("/api/storage/health", get(api_storage_health))
         .route("/health", get(health))
         .with_state(state)
 }
