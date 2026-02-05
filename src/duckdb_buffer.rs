@@ -1,6 +1,7 @@
 use crate::log_entry::LogEntry;
+use crate::process_monitor::ProcessInfo;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use duckdb::{Connection, params};
 use log::{debug, info};
 use serde_json::Value;
@@ -886,6 +887,120 @@ impl DuckDBBuffer {
             newest_minute,
         })
     }
+
+    /// Enforce retention policies on stored data.
+    /// This method runs atomically to completion - no cancellation checks mid-cleanup.
+    pub fn enforce_retention(
+        &mut self,
+        log_retention_days: u32,
+        log_max_size_gb: f64,
+        process_retention_days: u32,
+        process_max_size_gb: f64,
+    ) -> Result<RetentionStats> {
+        info!("Starting retention enforcement");
+        let mut stats = RetentionStats::default();
+
+        // Time-based cleanup for journal_logs
+        let log_cutoff = Utc::now() - TimeDelta::days(log_retention_days as i64);
+        let log_time_deleted = self.conn.execute(
+            "DELETE FROM journal_logs WHERE timestamp < ?",
+            params![log_cutoff.to_rfc3339()],
+        )?;
+        stats.logs_deleted_by_time = log_time_deleted;
+        if log_time_deleted > 0 {
+            info!("Deleted {} log entries older than {} days", log_time_deleted, log_retention_days);
+        }
+
+        // Time-based cleanup for process_metrics
+        let process_cutoff = Utc::now() - TimeDelta::days(process_retention_days as i64);
+        let process_time_deleted = self.conn.execute(
+            "DELETE FROM process_metrics WHERE timestamp < ?",
+            params![process_cutoff.to_rfc3339()],
+        )?;
+        stats.processes_deleted_by_time = process_time_deleted;
+        if process_time_deleted > 0 {
+            info!("Deleted {} process metrics older than {} days", process_time_deleted, process_retention_days);
+        }
+
+        // Size-based cleanup for logs
+        let log_max_bytes = (log_max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        let db_size = std::fs::metadata(&self.db_path)?.len();
+
+        if db_size > log_max_bytes {
+            info!("Database size {} MB exceeds log limit {} MB, deleting oldest logs",
+                  db_size / (1024 * 1024), log_max_bytes / (1024 * 1024));
+
+            // Delete oldest 10% of logs iteratively until under limit
+            loop {
+                let current_size = std::fs::metadata(&self.db_path)?.len();
+                if current_size <= log_max_bytes {
+                    break;
+                }
+
+                let deleted = self.conn.execute(
+                    "DELETE FROM journal_logs WHERE timestamp IN (
+                        SELECT timestamp FROM journal_logs ORDER BY timestamp ASC LIMIT (
+                            SELECT COUNT(*) / 10 FROM journal_logs
+                        )
+                    )",
+                    [],
+                )?;
+
+                stats.logs_deleted_by_size += deleted;
+
+                if deleted == 0 {
+                    break; // No more logs to delete
+                }
+
+                info!("Deleted {} oldest log entries (size enforcement)", deleted);
+            }
+        }
+
+        // Size-based cleanup for process_metrics
+        let process_max_bytes = (process_max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+
+        if db_size > process_max_bytes {
+            info!("Database size {} MB exceeds process limit {} MB, deleting oldest processes",
+                  db_size / (1024 * 1024), process_max_bytes / (1024 * 1024));
+
+            // Delete oldest 10% of process metrics iteratively until under limit
+            loop {
+                let current_size = std::fs::metadata(&self.db_path)?.len();
+                if current_size <= process_max_bytes {
+                    break;
+                }
+
+                let deleted = self.conn.execute(
+                    "DELETE FROM process_metrics WHERE timestamp IN (
+                        SELECT timestamp FROM process_metrics ORDER BY timestamp ASC LIMIT (
+                            SELECT COUNT(*) / 10 FROM process_metrics
+                        )
+                    )",
+                    [],
+                )?;
+
+                stats.processes_deleted_by_size += deleted;
+
+                if deleted == 0 {
+                    break; // No more process metrics to delete
+                }
+
+                info!("Deleted {} oldest process metrics (size enforcement)", deleted);
+            }
+        }
+
+        // Run VACUUM to reclaim space
+        if stats.total_deleted() > 0 {
+            info!("Running VACUUM to reclaim disk space");
+            self.vacuum()?;
+            let final_size = std::fs::metadata(&self.db_path)?.len();
+            info!("Retention enforcement complete. Final DB size: {} MB", final_size / (1024 * 1024));
+        } else {
+            debug!("No records deleted, skipping VACUUM");
+        }
+
+        Ok(stats)
+    }
 }
 
 #[derive(Debug)]
@@ -894,6 +1009,23 @@ pub struct BufferStats {
     pub buffered_minutes_count: usize,
     pub oldest_minute: Option<DateTime<Utc>>,
     pub newest_minute: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default)]
+pub struct RetentionStats {
+    pub logs_deleted_by_time: usize,
+    pub logs_deleted_by_size: usize,
+    pub processes_deleted_by_time: usize,
+    pub processes_deleted_by_size: usize,
+}
+
+impl RetentionStats {
+    pub fn total_deleted(&self) -> usize {
+        self.logs_deleted_by_time
+            + self.logs_deleted_by_size
+            + self.processes_deleted_by_time
+            + self.processes_deleted_by_size
+    }
 }
 
 #[cfg(test)]
@@ -1101,5 +1233,54 @@ mod tests {
         assert!(fields_obj.get("PRIORITY").is_none());
         assert!(fields_obj.get("_PID").is_none());
         assert!(fields_obj.get("_SYSTEMD_UNIT").is_none());
+    }
+
+    #[test]
+    fn test_retention_time_based_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
+
+        // Insert old log entry (40 days ago)
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("MESSAGE".to_string(), "Old log message".to_string());
+        let old_timestamp = Utc::now() - TimeDelta::days(40);
+        let old_entry = LogEntry::new(old_timestamp, fields.clone());
+        buffer.add_entry(&old_entry).unwrap();
+
+        // Insert recent log entry (5 days ago)
+        fields.insert("MESSAGE".to_string(), "Recent log message".to_string());
+        let recent_timestamp = Utc::now() - TimeDelta::days(5);
+        let recent_entry = LogEntry::new(recent_timestamp, fields);
+        buffer.add_entry(&recent_entry).unwrap();
+
+        // Verify both entries exist
+        assert_eq!(buffer.count_entries().unwrap(), 2);
+
+        // Enforce retention (30 days for logs)
+        let stats = buffer.enforce_retention(30, 100.0, 7, 100.0).unwrap();
+
+        // Old entry should be deleted, recent one retained
+        assert_eq!(stats.logs_deleted_by_time, 1);
+        assert_eq!(buffer.count_entries().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_retention_no_deletions_when_under_limits() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut buffer = DuckDBBuffer::new(temp_dir.path()).unwrap();
+
+        // Insert recent entry
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("MESSAGE".to_string(), "Recent message".to_string());
+        let timestamp = Utc::now() - TimeDelta::days(1);
+        let entry = LogEntry::new(timestamp, fields);
+        buffer.add_entry(&entry).unwrap();
+
+        // Enforce retention with generous limits
+        let stats = buffer.enforce_retention(30, 100.0, 7, 100.0).unwrap();
+
+        // Nothing should be deleted
+        assert_eq!(stats.total_deleted(), 0);
+        assert_eq!(buffer.count_entries().unwrap(), 1);
     }
 }
