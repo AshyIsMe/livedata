@@ -13,6 +13,9 @@ pub struct DuckDBBuffer {
     db_path: PathBuf,
 }
 
+/// Schema version for tracking migrations
+const CURRENT_SCHEMA_VERSION: i32 = 1;
+
 impl DuckDBBuffer {
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
         let data_dir = data_dir.as_ref();
@@ -28,7 +31,74 @@ impl DuckDBBuffer {
 
         let conn = Connection::open(&db_path)?;
 
-        // Create the main table for journal logs with all systemd journal fields (if not exists)
+        // Initialize schema versioning and run migrations
+        Self::initialize_schema_versioning(&conn)?;
+        Self::run_migrations(&conn)?;
+
+        info!(
+            "DuckDB database initialized successfully at: {}",
+            db_path.display()
+        );
+
+        Ok(Self { conn, db_path })
+    }
+
+    /// Initialize schema versioning table
+    fn initialize_schema_versioning(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                description TEXT
+            )",
+            [],
+        )?;
+        info!("Schema versioning table initialized");
+        Ok(())
+    }
+
+    /// Get current schema version from database
+    fn get_current_version(conn: &Connection) -> Result<i32> {
+        let mut stmt = conn.prepare("SELECT MAX(version) FROM _schema_version")?;
+        let mut rows = stmt.query([])?;
+
+        if let Some(row) = rows.next()? {
+            let version: Option<i32> = row.get(0)?;
+            Ok(version.unwrap_or(0))
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Record a migration as applied
+    fn record_migration(conn: &Connection, version: i32, description: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO _schema_version (version, description) VALUES (?, ?)",
+            params![version, description],
+        )?;
+        info!("Migration {} applied: {}", version, description);
+        Ok(())
+    }
+
+    /// Run all pending migrations
+    fn run_migrations(conn: &Connection) -> Result<()> {
+        let current_version = Self::get_current_version(conn)?;
+        info!("Current schema version: {}", current_version);
+
+        // Migration 1: Create process_metrics table and ensure journal_logs exists
+        if current_version < 1 {
+            info!("Applying migration 1: Create process_metrics table");
+            Self::migration_001(conn)?;
+            Self::record_migration(conn, 1, "Create process_metrics table and ensure journal_logs schema")?;
+        }
+
+        info!("Schema migrations complete. Current version: {}", CURRENT_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    /// Migration 001: Create process_metrics table and ensure journal_logs exists
+    fn migration_001(conn: &Connection) -> Result<()> {
+        // Ensure journal_logs table exists (may already exist from old code)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS journal_logs (
                 timestamp TIMESTAMP NOT NULL,
@@ -117,7 +187,7 @@ impl DuckDBBuffer {
             [],
         )?;
 
-        // Create indexes for efficient querying (if not exist)
+        // Ensure journal_logs indexes exist
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_minute_key ON journal_logs(minute_key)",
             [],
@@ -139,12 +209,37 @@ impl DuckDBBuffer {
             [],
         )?;
 
-        info!(
-            "DuckDB database initialized successfully at: {}",
-            db_path.display()
-        );
+        // Create process_metrics table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS process_metrics (
+                timestamp TIMESTAMP NOT NULL,
+                pid INTEGER NOT NULL,
+                name TEXT,
+                cpu_usage DOUBLE,
+                mem_usage DOUBLE,
+                user TEXT,
+                runtime BIGINT,
+                PRIMARY KEY (timestamp, pid)
+            )",
+            [],
+        )?;
 
-        Ok(Self { conn, db_path })
+        // Create indexes for process_metrics
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_process_timestamp ON process_metrics(timestamp)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_process_pid ON process_metrics(pid)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_process_name ON process_metrics(name)",
+            [],
+        )?;
+
+        info!("Migration 001: Created process_metrics table and ensured journal_logs schema");
+        Ok(())
     }
 
     /// Get the path to the database file
