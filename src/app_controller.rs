@@ -1,17 +1,20 @@
+use crate::config::Settings;
 use crate::duckdb_buffer::DuckDBBuffer;
 use crate::journal_reader::JournalLogReader;
 use crate::log_entry::LogEntry;
-use crate::process_monitor::ProcessMonitor;
+use crate::process_monitor::{ProcessMetricsBatch, ProcessMonitor};
 use anyhow::Result;
 use chrono::{TimeDelta, Utc};
 use gethostname::gethostname;
 use log::{error, info, warn};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 pub struct ApplicationController {
     journal_reader: JournalLogReader,
@@ -22,23 +25,97 @@ pub struct ApplicationController {
 }
 
 impl ApplicationController {
-    pub fn new<P: AsRef<std::path::Path>>(data_dir: P, process_interval: u64) -> Result<Self> {
+    pub fn new<P: AsRef<std::path::Path>>(
+        data_dir: P,
+        process_interval: u64,
+        settings: Settings,
+    ) -> Result<Self> {
         info!("Initializing Application Controller");
 
+        // Backup database before any migrations
+        Self::backup_database(&data_dir)?;
+
         let journal_reader = JournalLogReader::new()?;
-        let buffer = DuckDBBuffer::new(data_dir)?;
+        let buffer = DuckDBBuffer::new(&data_dir)?;
         let hostname = gethostname().to_str().unwrap_or("unknown").to_string();
         let shutdown_signal = Arc::new(AtomicBool::new(false));
 
-        let process_monitor = Arc::new(ProcessMonitor::new());
+        // Create mpsc channel for process metrics
+        let (metrics_tx, mut metrics_rx) = mpsc::channel::<ProcessMetricsBatch>(32);
+
+        // Create process monitor with metrics sender
+        let process_monitor = Arc::new(ProcessMonitor::with_metrics_sender(metrics_tx));
         process_monitor.start_collection(process_interval);
         info!(
             "Started process monitoring with {}s interval",
             process_interval
         );
 
+        // Get database path for the receiver task
+        let db_path = buffer.db_path().to_path_buf();
+
+        // Spawn dedicated receiver task in a thread to persist process metrics
+        thread::spawn(move || {
+            // Create tokio runtime for this thread
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+            rt.block_on(async move {
+                // Open a separate connection for process metrics
+                let conn = match duckdb::Connection::open(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to open database connection for process metrics: {}", e);
+                        return;
+                    }
+                };
+
+                while let Some(batch) = metrics_rx.recv().await {
+                    if batch.processes.is_empty() {
+                        continue;
+                    }
+
+                    // Batch insert all process metrics
+                    let result = conn.prepare(
+                        "INSERT INTO process_metrics (timestamp, pid, name, cpu_usage, mem_usage, user, runtime)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    ).and_then(|mut stmt| {
+                        for process in batch.processes {
+                            // Extract numeric UID from "Uid(1234)" format
+                            let user = process.user_id.as_ref().and_then(|uid_str| {
+                                uid_str.strip_prefix("Uid(")
+                                    .and_then(|s| s.strip_suffix(')'))
+                                    .map(|s| s.to_string())
+                            });
+
+                            stmt.execute(duckdb::params![
+                                batch.timestamp.to_rfc3339(),
+                                process.pid as i32,
+                                process.name,
+                                process.cpu_percent as f64,
+                                process.memory_bytes as f64,
+                                user,
+                                process.runtime_secs as i64,
+                            ])?;
+                        }
+                        Ok(())
+                    });
+
+                    if let Err(e) = result {
+                        error!("Failed to persist process metrics: {}", e);
+                    }
+                }
+            });
+        });
+
         info!("Application Controller initialized successfully");
         info!("Using on-disk DuckDB at: {}", buffer.db_path().display());
+
+        // Spawn background cleanup task
+        Self::spawn_cleanup_task(
+            buffer.db_path().to_path_buf(),
+            settings.clone(),
+            shutdown_signal.clone(),
+        );
 
         Ok(Self {
             journal_reader,
@@ -47,6 +124,79 @@ impl ApplicationController {
             shutdown_signal,
             process_monitor,
         })
+    }
+
+    /// Backup database file before migrations
+    fn backup_database<P: AsRef<std::path::Path>>(data_dir: P) -> Result<()> {
+        let db_path = data_dir.as_ref().join("livedata.duckdb");
+
+        if !db_path.exists() {
+            // No database to backup yet
+            return Ok(());
+        }
+
+        let backup_path = data_dir.as_ref().join("livedata.duckdb.bak");
+        info!("Backing up database to: {}", backup_path.display());
+
+        std::fs::copy(&db_path, &backup_path)?;
+        info!("Database backup complete");
+
+        Ok(())
+    }
+
+    /// Spawn background cleanup task that runs periodically
+    fn spawn_cleanup_task(
+        db_path: PathBuf,
+        settings: Settings,
+        shutdown_signal: Arc<AtomicBool>,
+    ) {
+        let interval_secs = settings.cleanup_interval_minutes * 60;
+
+        info!(
+            "Starting periodic storage cleanup (interval: {}m, priority: high)",
+            settings.cleanup_interval_minutes
+        );
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs as u64));
+
+            // First tick fires immediately
+            interval.tick().await;
+
+            loop {
+                // Run cleanup cycle uninterrupted
+                if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
+                    error!("Cleanup cycle failed: {}", e);
+                }
+
+                // Check shutdown signal AFTER cleanup completes
+                if shutdown_signal.load(Ordering::Relaxed) {
+                    info!("Cleanup task shutting down");
+                    break;
+                }
+
+                // Wait for next interval
+                interval.tick().await;
+            }
+        });
+    }
+
+    /// Run a single cleanup cycle (uninterruptible)
+    fn run_cleanup_cycle(db_path: &PathBuf, settings: &Settings) -> Result<()> {
+        let mut buffer = DuckDBBuffer::new(db_path.parent().unwrap())?;
+
+        let stats = buffer.enforce_retention(
+            settings.log_retention_days,
+            settings.log_max_size_gb,
+            settings.process_retention_days,
+            settings.process_max_size_gb,
+        )?;
+
+        if stats.total_deleted() > 0 {
+            info!("Cleanup cycle complete: {} total records deleted", stats.total_deleted());
+        }
+
+        Ok(())
     }
 
     pub fn get_shutdown_signal(&self) -> Arc<AtomicBool> {
@@ -271,14 +421,16 @@ mod tests {
     #[tokio::test]
     async fn test_application_controller_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let result = ApplicationController::new(temp_dir.path(), 5);
+        let settings = Settings::default();
+        let result = ApplicationController::new(temp_dir.path(), 5, settings);
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_status_retrieval() {
         let temp_dir = TempDir::new().unwrap();
-        let mut controller = ApplicationController::new(temp_dir.path(), 5).unwrap();
+        let settings = Settings::default();
+        let mut controller = ApplicationController::new(temp_dir.path(), 5, settings).unwrap();
 
         let status = controller.get_status().unwrap();
         assert_eq!(status.total_entries, 0);

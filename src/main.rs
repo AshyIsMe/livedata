@@ -40,6 +40,10 @@ struct Args {
     #[arg(long)]
     process_max_size_gb: Option<f64>,
 
+    /// Cleanup interval in minutes (5-15, clamped)
+    #[arg(long)]
+    cleanup_interval: Option<u32>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -72,6 +76,7 @@ fn main() -> Result<()> {
         args.log_max_size_gb,
         args.process_retention_days,
         args.process_max_size_gb,
+        args.cleanup_interval,
     )?;
 
     info!("Configuration loaded:");
@@ -79,6 +84,7 @@ fn main() -> Result<()> {
     info!("  Log max size: {} GB", settings.log_max_size_gb);
     info!("  Process retention: {} days", settings.process_retention_days);
     info!("  Process max size: {} GB", settings.process_max_size_gb);
+    info!("  Cleanup interval: {} minutes", settings.cleanup_interval_minutes);
 
     info!("Using data directory: {}", args.data_dir);
     if args.follow {
@@ -88,7 +94,7 @@ fn main() -> Result<()> {
     // Check if the web subcommand is present
     if let Some(Commands::Web) = args.command {
         // Create and run the application in the main thread
-        let mut app = ApplicationController::new(&args.data_dir, args.process_interval)?;
+        let mut app = ApplicationController::new(&args.data_dir, args.process_interval, settings)?;
 
         // Get shutdown signal to share with web server
         let shutdown_signal = app.get_shutdown_signal();
@@ -109,7 +115,7 @@ fn main() -> Result<()> {
         web_server_handle.join().unwrap();
     } else {
         // Create and run the application in the main thread
-        let mut app = ApplicationController::new(&args.data_dir, args.process_interval)?;
+        let mut app = ApplicationController::new(&args.data_dir, args.process_interval, settings)?;
         app.run(args.follow)?;
     }
 

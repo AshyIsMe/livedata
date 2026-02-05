@@ -18,9 +18,17 @@ pub struct Settings {
     /// Maximum process metrics database size in GB
     pub process_max_size_gb: f64,
 
+    /// Cleanup interval in minutes (clamped to 5-15 range)
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_minutes: u32,
+
     /// Path to the config file
     #[serde(skip)]
     pub config_file: PathBuf,
+}
+
+fn default_cleanup_interval() -> u32 {
+    10
 }
 
 impl Default for Settings {
@@ -30,6 +38,7 @@ impl Default for Settings {
             log_max_size_gb: 1.0,
             process_retention_days: 7,
             process_max_size_gb: 0.5,
+            cleanup_interval_minutes: 10,
             config_file: Self::default_config_path(),
         }
     }
@@ -67,6 +76,7 @@ impl Settings {
         log_max_size_gb: Option<f64>,
         process_retention_days: Option<u32>,
         process_max_size_gb: Option<f64>,
+        cleanup_interval_minutes: Option<u32>,
     ) -> Result<Self> {
         let mut settings = Self::load()?;
 
@@ -83,8 +93,16 @@ impl Settings {
         if let Some(size) = process_max_size_gb {
             settings.process_max_size_gb = size;
         }
+        if let Some(interval) = cleanup_interval_minutes {
+            settings.cleanup_interval_minutes = Self::clamp_cleanup_interval(interval);
+        }
 
         Ok(settings)
+    }
+
+    /// Clamp cleanup interval to 5-15 minute range
+    fn clamp_cleanup_interval(interval: u32) -> u32 {
+        interval.clamp(5, 15)
     }
 
     /// Load settings from a TOML file
@@ -123,6 +141,12 @@ impl Settings {
         if let Ok(val) = std::env::var("LIVEDATA_PROCESS_MAX_SIZE_GB") {
             if let Ok(size) = val.parse() {
                 self.process_max_size_gb = size;
+            }
+        }
+
+        if let Ok(val) = std::env::var("LIVEDATA_RETENTION_CLEANUP_INTERVAL") {
+            if let Ok(interval) = val.parse() {
+                self.cleanup_interval_minutes = Self::clamp_cleanup_interval(interval);
             }
         }
     }
@@ -184,11 +208,34 @@ mod tests {
             Some(2.0),
             Some(14),
             Some(1.0),
+            Some(8),
         ).unwrap();
 
         assert_eq!(settings.log_retention_days, 60);
         assert_eq!(settings.log_max_size_gb, 2.0);
         assert_eq!(settings.process_retention_days, 14);
         assert_eq!(settings.process_max_size_gb, 1.0);
+        assert_eq!(settings.cleanup_interval_minutes, 8);
+    }
+
+    #[test]
+    fn test_cleanup_interval_clamping() {
+        // Test below minimum
+        let settings = Settings::load_with_cli_args(
+            None, None, None, None, Some(3),
+        ).unwrap();
+        assert_eq!(settings.cleanup_interval_minutes, 5);
+
+        // Test above maximum
+        let settings = Settings::load_with_cli_args(
+            None, None, None, None, Some(20),
+        ).unwrap();
+        assert_eq!(settings.cleanup_interval_minutes, 15);
+
+        // Test within range
+        let settings = Settings::load_with_cli_args(
+            None, None, None, None, Some(10),
+        ).unwrap();
+        assert_eq!(settings.cleanup_interval_minutes, 10);
     }
 }
