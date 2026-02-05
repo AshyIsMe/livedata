@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use livedata::app_controller::ApplicationController;
+use livedata::config::Settings;
 use livedata::web_server::run_web_server;
 use std::thread;
 use tracing::info;
@@ -22,6 +23,22 @@ struct Args {
     /// Process collection interval in seconds
     #[arg(short = 'p', long, default_value = "5")]
     process_interval: u64,
+
+    /// Number of days to retain log data
+    #[arg(long)]
+    log_retention_days: Option<u32>,
+
+    /// Maximum log database size in GB
+    #[arg(long)]
+    log_max_size_gb: Option<f64>,
+
+    /// Number of days to retain process metrics
+    #[arg(long)]
+    process_retention_days: Option<u32>,
+
+    /// Maximum process metrics database size in GB
+    #[arg(long)]
+    process_max_size_gb: Option<f64>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -48,6 +65,20 @@ fn main() -> Result<()> {
 
     // Parse command line arguments
     let args = Args::parse();
+
+    // Load configuration with CLI overrides
+    let settings = Settings::load_with_cli_args(
+        args.log_retention_days,
+        args.log_max_size_gb,
+        args.process_retention_days,
+        args.process_max_size_gb,
+    )?;
+
+    info!("Configuration loaded:");
+    info!("  Log retention: {} days", settings.log_retention_days);
+    info!("  Log max size: {} GB", settings.log_max_size_gb);
+    info!("  Process retention: {} days", settings.process_retention_days);
+    info!("  Process max size: {} GB", settings.process_max_size_gb);
 
     info!("Using data directory: {}", args.data_dir);
     if args.follow {
