@@ -1,6 +1,8 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use sysinfo::{ProcessesToUpdate, System};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 
 /// Process information snapshot
@@ -14,16 +16,18 @@ pub struct ProcessInfo {
     pub runtime_secs: u64,
 }
 
+/// Batch of process metrics with timestamp
+#[derive(Debug, Clone)]
+pub struct ProcessMetricsBatch {
+    pub processes: Vec<ProcessInfo>,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Background process collection service
 pub struct ProcessMonitor {
     system: Arc<Mutex<System>>,
     snapshot: Arc<Mutex<Vec<ProcessInfo>>>,
-}
-
-impl Default for ProcessMonitor {
-    fn default() -> Self {
-        Self::new()
-    }
+    metrics_tx: Option<mpsc::Sender<ProcessMetricsBatch>>,
 }
 
 impl ProcessMonitor {
@@ -35,6 +39,19 @@ impl ProcessMonitor {
         Self {
             system: Arc::new(Mutex::new(system)),
             snapshot: Arc::new(Mutex::new(Vec::new())),
+            metrics_tx: None,
+        }
+    }
+
+    /// Initialize with a metrics sender for persistence
+    pub fn with_metrics_sender(metrics_tx: mpsc::Sender<ProcessMetricsBatch>) -> Self {
+        let mut system = System::new_all();
+        system.refresh_all();
+
+        Self {
+            system: Arc::new(Mutex::new(system)),
+            snapshot: Arc::new(Mutex::new(Vec::new())),
+            metrics_tx: Some(metrics_tx),
         }
     }
 
@@ -43,11 +60,12 @@ impl ProcessMonitor {
     pub fn start_collection(&self, interval_secs: u64) {
         let system = self.system.clone();
         let snapshot = self.snapshot.clone();
+        let metrics_tx = self.metrics_tx.clone();
 
         std::thread::spawn(move || {
             // Create a local tokio runtime for this thread
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            
+
             rt.block_on(async move {
                 let mut ticker = interval(Duration::from_secs(interval_secs));
 
@@ -71,7 +89,24 @@ impl ProcessMonitor {
                         })
                         .collect();
 
-                    *snapshot.lock().unwrap() = processes;
+                    *snapshot.lock().unwrap() = processes.clone();
+
+                    // Send batch to persistence channel if available
+                    if let Some(ref tx) = metrics_tx {
+                        let batch = ProcessMetricsBatch {
+                            processes: processes.clone(),
+                            timestamp: Utc::now(),
+                        };
+
+                        log::debug!("Sending batch with {} processes to persistence", batch.processes.len());
+
+                        // Try to send without blocking - log warning if channel is full
+                        if let Err(e) = tx.try_send(batch) {
+                            log::warn!("Failed to send process metrics batch: {}", e);
+                        } else {
+                            log::debug!("Successfully sent process metrics batch");
+                        }
+                    }
                 }
             });
         });

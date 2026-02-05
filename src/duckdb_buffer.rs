@@ -592,6 +592,40 @@ impl DuckDBBuffer {
         Ok(())
     }
 
+    /// Add a batch of process metrics to the database
+    pub fn add_process_metrics(&mut self, processes: Vec<ProcessInfo>, timestamp: DateTime<Utc>) -> Result<()> {
+        if processes.is_empty() {
+            return Ok(());
+        }
+
+        // Batch insert all process metrics
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO process_metrics (timestamp, pid, name, cpu_usage, mem_usage, user, runtime)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )?;
+
+        for process in processes {
+            // Extract numeric UID from "Uid(1234)" format
+            let user = process.user_id.as_ref().and_then(|uid_str| {
+                uid_str.strip_prefix("Uid(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .map(|s| s.to_string())
+            });
+
+            stmt.execute(params![
+                timestamp.to_rfc3339(),
+                process.pid as i32,
+                process.name,
+                process.cpu_percent as f64,
+                process.memory_bytes as f64,
+                user,
+                process.runtime_secs as i64,
+            ])?;
+        }
+
+        Ok(())
+    }
+
     pub fn get_entries_for_minute(
         &mut self,
         minute_key: DateTime<Utc>,

@@ -69,39 +69,51 @@ impl ApplicationController {
                     }
                 };
 
+                info!("Process metrics receiver task started");
+
                 while let Some(batch) = metrics_rx.recv().await {
+                    let process_count = batch.processes.len();
+                    info!("Received process metrics batch with {} processes", process_count);
+
                     if batch.processes.is_empty() {
                         continue;
                     }
 
-                    // Batch insert all process metrics
-                    let result = conn.prepare(
-                        "INSERT INTO process_metrics (timestamp, pid, name, cpu_usage, mem_usage, user, runtime)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)"
-                    ).and_then(|mut stmt| {
-                        for process in batch.processes {
-                            // Extract numeric UID from "Uid(1234)" format
-                            let user = process.user_id.as_ref().and_then(|uid_str| {
-                                uid_str.strip_prefix("Uid(")
-                                    .and_then(|s| s.strip_suffix(')'))
-                                    .map(|s| s.to_string())
-                            });
+                    // Batch insert all process metrics in a transaction
+                    let result = conn.execute("BEGIN TRANSACTION", [])
+                        .and_then(|_| {
+                            let mut stmt = conn.prepare(
+                                "INSERT INTO process_metrics (timestamp, pid, name, cpu_usage, mem_usage, user, runtime)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+                            )?;
 
-                            stmt.execute(duckdb::params![
-                                batch.timestamp.to_rfc3339(),
-                                process.pid as i32,
-                                process.name,
-                                process.cpu_percent as f64,
-                                process.memory_bytes as f64,
-                                user,
-                                process.runtime_secs as i64,
-                            ])?;
-                        }
-                        Ok(())
-                    });
+                            for process in batch.processes {
+                                // Extract numeric UID from "Uid(1234)" format
+                                let user = process.user_id.as_ref().and_then(|uid_str| {
+                                    uid_str.strip_prefix("Uid(")
+                                        .and_then(|s| s.strip_suffix(')'))
+                                        .map(|s| s.to_string())
+                                });
+
+                                stmt.execute(duckdb::params![
+                                    batch.timestamp.to_rfc3339(),
+                                    process.pid as i32,
+                                    process.name,
+                                    process.cpu_percent as f64,
+                                    process.memory_bytes as f64,
+                                    user,
+                                    process.runtime_secs as i64,
+                                ])?;
+                            }
+
+                            conn.execute("COMMIT", [])?;
+                            conn.execute("CHECKPOINT", [])
+                        });
 
                     if let Err(e) = result {
                         error!("Failed to persist process metrics: {}", e);
+                    } else {
+                        info!("Successfully persisted {} process metrics", process_count);
                     }
                 }
             });
@@ -157,27 +169,32 @@ impl ApplicationController {
             settings.cleanup_interval_minutes
         );
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs as u64));
+        thread::spawn(move || {
+            // Create tokio runtime for this thread
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
-            // First tick fires immediately
-            interval.tick().await;
+            rt.block_on(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs as u64));
 
-            loop {
-                // Run cleanup cycle uninterrupted
-                if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
-                    error!("Cleanup cycle failed: {}", e);
-                }
-
-                // Check shutdown signal AFTER cleanup completes
-                if shutdown_signal.load(Ordering::Relaxed) {
-                    info!("Cleanup task shutting down");
-                    break;
-                }
-
-                // Wait for next interval
+                // First tick fires immediately
                 interval.tick().await;
-            }
+
+                loop {
+                    // Run cleanup cycle uninterrupted
+                    if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
+                        error!("Cleanup cycle failed: {}", e);
+                    }
+
+                    // Check shutdown signal AFTER cleanup completes
+                    if shutdown_signal.load(Ordering::Relaxed) {
+                        info!("Cleanup task shutting down");
+                        break;
+                    }
+
+                    // Wait for next interval
+                    interval.tick().await;
+                }
+            });
         });
     }
 
