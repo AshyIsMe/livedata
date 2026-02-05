@@ -10,25 +10,25 @@ See: .planning/PROJECT.md (updated 2026-02-01)
 ## Current Position
 
 Phase: 2 of 3 (Storage Enhancements)
-Plan: 1 of 4 in current phase
+Plan: 2 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-05 — Completed 02-01-PLAN.md (Configuration and Schema)
+Last activity: 2026-02-05 — Completed 02-02-PLAN.md (Automated Cleanup)
 
-Progress: [█████░░░░░] 50%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
+- Total plans completed: 6
 - Average duration: 5 min
-- Total execution time: 0.42 hours
+- Total execution time: 0.49 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4 | 18 min | 4.5 min |
-| 2 | 1 | 6 min | 6.0 min |
+| 2 | 2 | 10 min | 5.0 min |
 
 **Recent Trend:**
 - Last 5 plans: 5 completed
@@ -62,6 +62,12 @@ Recent decisions affecting current work:
 | 02-01 | Schema version in _schema_version table with description and timestamp | Enables tracking which migrations applied when for debugging |
 | 02-01 | Migration 001 ensures both journal_logs and process_metrics exist | Handles fresh installs and upgrades from pre-migration codebase |
 | 02-01 | Default retention: logs 30d/1GB, processes 7d/0.5GB | Conservative defaults balance storage cost with debugging utility |
+| 02-02 | Cleanup interval clamped to 5-15 minute range per user decision | Balances responsiveness with system overhead |
+| 02-02 | Cleanup cycles are uninterruptible | No cancellation checks during enforce_retention() prevents partially-cleaned databases |
+| 02-02 | Background cleanup spawned as tokio::spawn (high-priority async task) | Cleanup is async-friendly, runs at high priority |
+| 02-02 | Shutdown signal checked only BETWEEN cleanup cycles | Cleanup must complete once started |
+| 02-02 | Database backup created before migrations run (*.duckdb.bak) | Protects against migration failures destroying data |
+| 02-02 | Cleanup runs immediately at startup, then periodically | Catches accumulated old data on restart |
 
 ### Pending Todos
 
@@ -77,6 +83,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-05 21:57 UTC
-Stopped at: Completed 02-01-PLAN.md (Configuration and Schema)
+Last session: 2026-02-05 22:05 UTC
+Stopped at: Completed 02-02-PLAN.md (Automated Cleanup)
 Resume file: None
