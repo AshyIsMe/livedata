@@ -5,33 +5,34 @@
 See: .planning/PROJECT.md (updated 2026-02-01)
 
 **Core value:** Instant system observability without infrastructure overhead — download, run, and understand what's happening
-**Current focus:** Phase 1: Process Monitoring Core
+**Current focus:** Phase 2: Storage Enhancements
 
 ## Current Position
 
-Phase: 1 of 3 (Process Monitoring Core)
-Plan: 4 of 4 in current phase
-Status: Phase complete - ready for transition
-Last activity: 2026-02-03 — Completed 01-04-PLAN.md (Fix process table rendering)
+Phase: 2 of 3 (Storage Enhancements)
+Plan: 1 of 4 in current phase
+Status: In progress
+Last activity: 2026-02-05 — Completed 02-01-PLAN.md (Configuration and Schema)
 
-Progress: [████░░░░░░] 40%
+Progress: [█████░░░░░] 50%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
+- Total plans completed: 5
 - Average duration: 5 min
-- Total execution time: 0.33 hours
+- Total execution time: 0.42 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4 | 18 min | 4.5 min |
+| 2 | 1 | 6 min | 6.0 min |
 
 **Recent Trend:**
-- Last 5 plans: 4 completed
-- Trend: Accelerating
+- Last 5 plans: 5 completed
+- Trend: Steady
 
 *Updated after each plan completion*
 
@@ -56,6 +57,11 @@ Recent decisions affecting current work:
 | 01-04 | Extensive console logging for frontend debugging | Easier diagnosis of rendering issues |
 | 01-04 | Extract numeric UID from sysinfo's Uid() format | Cleaner display than raw "Uid(1234)" string |
 | 01-04 | Visible error messages instead of console-only | Better user experience when errors occur |
+| 02-01 | Multi-source configuration with priority: CLI > Env vars > Config file > Defaults | Maximum flexibility for different deployment scenarios |
+| 02-01 | Auto-create default config at ~/.livedata/config.toml | Better UX - users get working config immediately |
+| 02-01 | Schema version in _schema_version table with description and timestamp | Enables tracking which migrations applied when for debugging |
+| 02-01 | Migration 001 ensures both journal_logs and process_metrics exist | Handles fresh installs and upgrades from pre-migration codebase |
+| 02-01 | Default retention: logs 30d/1GB, processes 7d/0.5GB | Conservative defaults balance storage cost with debugging utility |
 
 ### Pending Todos
 
@@ -71,6 +77,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-03 13:40 UTC
-Stopped at: Completed 01-04-PLAN.md (Fixed process table rendering issue)
+Last session: 2026-02-05 21:57 UTC
+Stopped at: Completed 02-01-PLAN.md (Configuration and Schema)
 Resume file: None
