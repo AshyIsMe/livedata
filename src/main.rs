@@ -82,9 +82,15 @@ fn main() -> Result<()> {
     info!("Configuration loaded:");
     info!("  Log retention: {} days", settings.log_retention_days);
     info!("  Log max size: {} GB", settings.log_max_size_gb);
-    info!("  Process retention: {} days", settings.process_retention_days);
+    info!(
+        "  Process retention: {} days",
+        settings.process_retention_days
+    );
     info!("  Process max size: {} GB", settings.process_max_size_gb);
-    info!("  Cleanup interval: {} minutes", settings.cleanup_interval_minutes);
+    info!(
+        "  Cleanup interval: {} minutes",
+        settings.cleanup_interval_minutes
+    );
 
     info!("Using data directory: {}", args.data_dir);
     if args.follow {
@@ -107,7 +113,12 @@ fn main() -> Result<()> {
         let data_dir = args.data_dir.clone();
         let web_server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(run_web_server(&data_dir, shutdown_signal, process_monitor, settings_for_web));
+            rt.block_on(run_web_server(
+                &data_dir,
+                shutdown_signal,
+                process_monitor,
+                settings_for_web,
+            ));
         });
 
         app.run(args.follow)?;

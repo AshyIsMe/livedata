@@ -90,10 +90,17 @@ impl DuckDBBuffer {
         if current_version < 1 {
             info!("Applying migration 1: Create process_metrics table");
             Self::migration_001(conn)?;
-            Self::record_migration(conn, 1, "Create process_metrics table and ensure journal_logs schema")?;
+            Self::record_migration(
+                conn,
+                1,
+                "Create process_metrics table and ensure journal_logs schema",
+            )?;
         }
 
-        info!("Schema migrations complete. Current version: {}", CURRENT_SCHEMA_VERSION);
+        info!(
+            "Schema migrations complete. Current version: {}",
+            CURRENT_SCHEMA_VERSION
+        );
         Ok(())
     }
 
@@ -593,7 +600,11 @@ impl DuckDBBuffer {
     }
 
     /// Add a batch of process metrics to the database
-    pub fn add_process_metrics(&mut self, processes: Vec<ProcessInfo>, timestamp: DateTime<Utc>) -> Result<()> {
+    pub fn add_process_metrics(
+        &mut self,
+        processes: Vec<ProcessInfo>,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
         if processes.is_empty() {
             return Ok(());
         }
@@ -607,7 +618,8 @@ impl DuckDBBuffer {
         for process in processes {
             // Extract numeric UID from "Uid(1234)" format
             let user = process.user_id.as_ref().and_then(|uid_str| {
-                uid_str.strip_prefix("Uid(")
+                uid_str
+                    .strip_prefix("Uid(")
                     .and_then(|s| s.strip_suffix(')'))
                     .map(|s| s.to_string())
             });
@@ -942,7 +954,10 @@ impl DuckDBBuffer {
         )?;
         stats.logs_deleted_by_time = log_time_deleted;
         if log_time_deleted > 0 {
-            info!("Deleted {} log entries older than {} days", log_time_deleted, log_retention_days);
+            info!(
+                "Deleted {} log entries older than {} days",
+                log_time_deleted, log_retention_days
+            );
         }
 
         // Time-based cleanup for process_metrics
@@ -953,7 +968,10 @@ impl DuckDBBuffer {
         )?;
         stats.processes_deleted_by_time = process_time_deleted;
         if process_time_deleted > 0 {
-            info!("Deleted {} process metrics older than {} days", process_time_deleted, process_retention_days);
+            info!(
+                "Deleted {} process metrics older than {} days",
+                process_time_deleted, process_retention_days
+            );
         }
 
         // Size-based cleanup for logs
@@ -961,8 +979,11 @@ impl DuckDBBuffer {
         let db_size = std::fs::metadata(&self.db_path)?.len();
 
         if db_size > log_max_bytes {
-            info!("Database size {} MB exceeds log limit {} MB, deleting oldest logs",
-                  db_size / (1024 * 1024), log_max_bytes / (1024 * 1024));
+            info!(
+                "Database size {} MB exceeds log limit {} MB, deleting oldest logs",
+                db_size / (1024 * 1024),
+                log_max_bytes / (1024 * 1024)
+            );
 
             // Delete oldest 10% of logs iteratively until under limit
             loop {
@@ -994,8 +1015,11 @@ impl DuckDBBuffer {
         let process_max_bytes = (process_max_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
 
         if db_size > process_max_bytes {
-            info!("Database size {} MB exceeds process limit {} MB, deleting oldest processes",
-                  db_size / (1024 * 1024), process_max_bytes / (1024 * 1024));
+            info!(
+                "Database size {} MB exceeds process limit {} MB, deleting oldest processes",
+                db_size / (1024 * 1024),
+                process_max_bytes / (1024 * 1024)
+            );
 
             // Delete oldest 10% of process metrics iteratively until under limit
             loop {
@@ -1019,7 +1043,10 @@ impl DuckDBBuffer {
                     break; // No more process metrics to delete
                 }
 
-                info!("Deleted {} oldest process metrics (size enforcement)", deleted);
+                info!(
+                    "Deleted {} oldest process metrics (size enforcement)",
+                    deleted
+                );
             }
         }
 
@@ -1028,7 +1055,10 @@ impl DuckDBBuffer {
             info!("Running VACUUM to reclaim disk space");
             self.vacuum()?;
             let final_size = std::fs::metadata(&self.db_path)?.len();
-            info!("Retention enforcement complete. Final DB size: {} MB", final_size / (1024 * 1024));
+            info!(
+                "Retention enforcement complete. Final DB size: {} MB",
+                final_size / (1024 * 1024)
+            );
         } else {
             debug!("No records deleted, skipping VACUUM");
         }
