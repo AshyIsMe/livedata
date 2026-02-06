@@ -107,11 +107,10 @@ impl Settings {
 
     /// Load settings from a TOML file
     fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let contents = fs::read_to_string(path.as_ref())
-            .context("Failed to read config file")?;
+        let contents = fs::read_to_string(path.as_ref()).context("Failed to read config file")?;
 
-        let mut settings: Settings = toml::from_str(&contents)
-            .context("Failed to parse config file")?;
+        let mut settings: Settings =
+            toml::from_str(&contents).context("Failed to parse config file")?;
 
         settings.config_file = path.as_ref().to_path_buf();
 
@@ -120,34 +119,34 @@ impl Settings {
 
     /// Apply environment variable overrides
     fn apply_env_vars(&mut self) {
-        if let Ok(val) = std::env::var("LIVEDATA_LOG_RETENTION_DAYS") {
-            if let Ok(days) = val.parse() {
-                self.log_retention_days = days;
-            }
+        if let Ok(val) = std::env::var("LIVEDATA_LOG_RETENTION_DAYS")
+            && let Ok(days) = val.parse()
+        {
+            self.log_retention_days = days;
         }
 
-        if let Ok(val) = std::env::var("LIVEDATA_LOG_MAX_SIZE_GB") {
-            if let Ok(size) = val.parse() {
-                self.log_max_size_gb = size;
-            }
+        if let Ok(val) = std::env::var("LIVEDATA_LOG_MAX_SIZE_GB")
+            && let Ok(size) = val.parse()
+        {
+            self.log_max_size_gb = size;
         }
 
-        if let Ok(val) = std::env::var("LIVEDATA_PROCESS_RETENTION_DAYS") {
-            if let Ok(days) = val.parse() {
-                self.process_retention_days = days;
-            }
+        if let Ok(val) = std::env::var("LIVEDATA_PROCESS_RETENTION_DAYS")
+            && let Ok(days) = val.parse()
+        {
+            self.process_retention_days = days;
         }
 
-        if let Ok(val) = std::env::var("LIVEDATA_PROCESS_MAX_SIZE_GB") {
-            if let Ok(size) = val.parse() {
-                self.process_max_size_gb = size;
-            }
+        if let Ok(val) = std::env::var("LIVEDATA_PROCESS_MAX_SIZE_GB")
+            && let Ok(size) = val.parse()
+        {
+            self.process_max_size_gb = size;
         }
 
-        if let Ok(val) = std::env::var("LIVEDATA_RETENTION_CLEANUP_INTERVAL") {
-            if let Ok(interval) = val.parse() {
-                self.cleanup_interval_minutes = Self::clamp_cleanup_interval(interval);
-            }
+        if let Ok(val) = std::env::var("LIVEDATA_RETENTION_CLEANUP_INTERVAL")
+            && let Ok(interval) = val.parse()
+        {
+            self.cleanup_interval_minutes = Self::clamp_cleanup_interval(interval);
         }
     }
 
@@ -157,16 +156,14 @@ impl Settings {
 
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
 
         let default_settings = Settings::default();
         let toml_content = toml::to_string_pretty(&default_settings)
             .context("Failed to serialize default config")?;
 
-        fs::write(path, toml_content)
-            .context("Failed to write default config file")?;
+        fs::write(path, toml_content).context("Failed to write default config file")?;
 
         Ok(())
     }
@@ -203,13 +200,9 @@ mod tests {
 
     #[test]
     fn test_cli_overrides() {
-        let settings = Settings::load_with_cli_args(
-            Some(60),
-            Some(2.0),
-            Some(14),
-            Some(1.0),
-            Some(8),
-        ).unwrap();
+        let settings =
+            Settings::load_with_cli_args(Some(60), Some(2.0), Some(14), Some(1.0), Some(8))
+                .unwrap();
 
         assert_eq!(settings.log_retention_days, 60);
         assert_eq!(settings.log_max_size_gb, 2.0);
@@ -221,21 +214,15 @@ mod tests {
     #[test]
     fn test_cleanup_interval_clamping() {
         // Test below minimum
-        let settings = Settings::load_with_cli_args(
-            None, None, None, None, Some(3),
-        ).unwrap();
+        let settings = Settings::load_with_cli_args(None, None, None, None, Some(3)).unwrap();
         assert_eq!(settings.cleanup_interval_minutes, 5);
 
         // Test above maximum
-        let settings = Settings::load_with_cli_args(
-            None, None, None, None, Some(20),
-        ).unwrap();
+        let settings = Settings::load_with_cli_args(None, None, None, None, Some(20)).unwrap();
         assert_eq!(settings.cleanup_interval_minutes, 15);
 
         // Test within range
-        let settings = Settings::load_with_cli_args(
-            None, None, None, None, Some(10),
-        ).unwrap();
+        let settings = Settings::load_with_cli_args(None, None, None, None, Some(10)).unwrap();
         assert_eq!(settings.cleanup_interval_minutes, 10);
     }
 }

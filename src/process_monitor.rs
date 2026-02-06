@@ -30,6 +30,12 @@ pub struct ProcessMonitor {
     metrics_tx: Option<mpsc::Sender<ProcessMetricsBatch>>,
 }
 
+impl Default for ProcessMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessMonitor {
     /// Initialize a new process monitor with fresh system state
     pub fn new() -> Self {
@@ -98,7 +104,10 @@ impl ProcessMonitor {
                             timestamp: Utc::now(),
                         };
 
-                        log::debug!("Sending batch with {} processes to persistence", batch.processes.len());
+                        log::debug!(
+                            "Sending batch with {} processes to persistence",
+                            batch.processes.len()
+                        );
 
                         // Try to send without blocking - log warning if channel is full
                         if let Err(e) = tx.try_send(batch) {

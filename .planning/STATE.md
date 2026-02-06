@@ -10,25 +10,25 @@ See: .planning/PROJECT.md (updated 2026-02-01)
 ## Current Position
 
 Phase: 2 of 3 (Storage Enhancements)
-Plan: 2 of 4 in current phase
+Plan: 3 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-05 — Completed 02-02-PLAN.md (Automated Cleanup)
+Last activity: 2026-02-05 — Completed 02-03-PLAN.md (Process Persistence and Storage Health)
 
-Progress: [██████░░░░] 60%
+Progress: [███████░░░] 70%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
-- Average duration: 5 min
-- Total execution time: 0.49 hours
+- Total plans completed: 7
+- Average duration: 6 min
+- Total execution time: 0.69 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | 4 | 18 min | 4.5 min |
-| 2 | 2 | 10 min | 5.0 min |
+| 2 | 3 | 22 min | 7.3 min |
 
 **Recent Trend:**
 - Last 5 plans: 5 completed
@@ -68,6 +68,11 @@ Recent decisions affecting current work:
 | 02-02 | Shutdown signal checked only BETWEEN cleanup cycles | Cleanup must complete once started |
 | 02-02 | Database backup created before migrations run (*.duckdb.bak) | Protects against migration failures destroying data |
 | 02-02 | Cleanup runs immediately at startup, then periodically | Catches accumulated old data on restart |
+| 02-03 | Use mpsc channel to decouple process collection from persistence | Non-blocking try_send with warning on full channel, clean separation of concerns |
+| 02-03 | Spawn dedicated receiver task with separate DuckDB connection | Avoids contention on main buffer's connection, independent lifecycle |
+| 02-03 | Add CHECKPOINT after COMMIT for data durability | DuckDB WAL may buffer writes until checkpoint, CHECKPOINT forces flush to disk |
+| 02-03 | Extract numeric UID from Uid() format for storage | sysinfo returns "Uid(1234)", strip prefix/suffix for clean numeric user ID |
+| 02-03 | Pass Settings to web server for retention policy exposure | Storage health API needs retention configuration, added Settings field to AppState |
 
 ### Pending Todos
 
@@ -83,6 +88,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-05 22:05 UTC
-Stopped at: Completed 02-02-PLAN.md (Automated Cleanup)
+Last session: 2026-02-05 22:13 UTC
+Stopped at: Completed 02-03-PLAN.md (Process Persistence and Storage Health)
 Resume file: None

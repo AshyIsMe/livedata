@@ -9,9 +9,9 @@ use gethostname::gethostname;
 use log::{error, info, warn};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -157,11 +157,7 @@ impl ApplicationController {
     }
 
     /// Spawn background cleanup task that runs periodically
-    fn spawn_cleanup_task(
-        db_path: PathBuf,
-        settings: Settings,
-        shutdown_signal: Arc<AtomicBool>,
-    ) {
+    fn spawn_cleanup_task(db_path: PathBuf, settings: Settings, shutdown_signal: Arc<AtomicBool>) {
         let interval_secs = settings.cleanup_interval_minutes * 60;
 
         info!(
@@ -199,7 +195,7 @@ impl ApplicationController {
     }
 
     /// Run a single cleanup cycle (uninterruptible)
-    fn run_cleanup_cycle(db_path: &PathBuf, settings: &Settings) -> Result<()> {
+    fn run_cleanup_cycle(db_path: &Path, settings: &Settings) -> Result<()> {
         let mut buffer = DuckDBBuffer::new(db_path.parent().unwrap())?;
 
         let stats = buffer.enforce_retention(
@@ -210,7 +206,10 @@ impl ApplicationController {
         )?;
 
         if stats.total_deleted() > 0 {
-            info!("Cleanup cycle complete: {} total records deleted", stats.total_deleted());
+            info!(
+                "Cleanup cycle complete: {} total records deleted",
+                stats.total_deleted()
+            );
         }
 
         Ok(())
