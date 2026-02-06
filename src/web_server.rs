@@ -261,7 +261,8 @@ pub async fn run_web_server(
     settings: Settings,
 ) {
     let state = Arc::new(
-        AppState::new(data_dir, process_monitor, settings).expect("Failed to create application state"),
+        AppState::new(data_dir, process_monitor, settings)
+            .expect("Failed to create application state"),
     );
 
     let app = Router::new()
@@ -353,9 +354,7 @@ async fn api_storage_health(
 
     // Get database file size
     let db_path = std::path::Path::new(&state.data_dir).join("livedata.duckdb");
-    let database_size_bytes = std::fs::metadata(&db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let database_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     // Get journal log count
     let journal_log_count: i64 = conn
@@ -1104,10 +1103,56 @@ fn build_search_html(
             color: #eee;
             line-height: 1.5;
         }}
+        .global-header {{
+            background-color: #0f3460;
+            border-bottom: 2px solid #00d9ff;
+            margin-bottom: 0;
+        }}
+        .global-header nav {{
+            display: flex;
+            gap: 5px;
+            padding: 12px 20px;
+            max-width: 100%;
+        }}
+        .global-header nav a {{
+            color: #00d9ff;
+            text-decoration: none;
+            font-size: 15px;
+            font-weight: 500;
+            padding: 8px 15px;
+            border-radius: 4px;
+            transition: background-color 0.2s;
+        }}
+        .global-header nav a:hover {{
+            background-color: #16213e;
+        }}
+        .global-header nav a.active {{
+            background-color: #00d9ff;
+            color: #1a1a2e;
+        }}
         .container {{
             max-width: 100%;
             padding: 20px;
         }}
+        #storage-health {{
+            background-color: #16213e;
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            border: 1px solid #0f3460;
+        }}
+        #storage-health .health-item {{
+            display: inline-block;
+            margin-right: 25px;
+        }}
+        #storage-health .health-label {{
+            color: #888;
+            margin-right: 5px;
+        }}
+        #storage-health .status-good {{ color: #28a745; }}
+        #storage-health .status-warning {{ color: #ffc107; }}
+        #storage-health .status-critical {{ color: #dc3545; }}
         header {{
             background-color: #16213e;
             padding: 15px 20px;
@@ -1447,10 +1492,26 @@ fn build_search_html(
     </style>
 </head>
 <body>
-    <header>
-        <h1>Livedata Log Search</h1>
-    </header>
+    <div class="global-header">
+        <nav>
+            <a href="/" target="_blank" class="active">Log Search</a>
+            <a href="/processes.html" target="_blank">Processes</a>
+        </nav>
+    </div>
     <div class="container">
+        <div id="storage-health">
+            <span class="health-item">
+                <span class="health-label">Storage:</span>
+                <span id="storage-info">Loading...</span>
+            </span>
+            <span class="health-item">
+                <span class="health-label">Retention:</span>
+                <span id="retention-info">Loading...</span>
+            </span>
+        </div>
+        <header>
+            <h1>Livedata Log Search</h1>
+        </header>
         <form class="search-form" method="get" action="/">
             <div class="search-row">
                 <div class="form-group search-input">
@@ -1814,6 +1875,47 @@ fn build_search_html(
                 columnsInput.value = savedCols.join(',');
             }}
         }})();
+
+        // Storage health indicator
+        (async function() {{
+            async function updateStorageHealth() {{
+                try {{
+                    const response = await fetch('/api/storage/health');
+                    if (!response.ok) throw new Error('Failed to fetch storage health');
+
+                    const data = await response.json();
+
+                    // Calculate storage usage percentage
+                    const sizeGB = (data.database_size_bytes / (1024 * 1024 * 1024)).toFixed(2);
+                    const maxSizeGB = Math.max(data.retention_policy.log_max_size_gb, data.retention_policy.process_max_size_gb);
+                    const usagePercent = (parseFloat(sizeGB) / maxSizeGB) * 100;
+
+                    // Determine status color
+                    let statusClass = 'status-good';
+                    if (usagePercent >= 90) statusClass = 'status-critical';
+                    else if (usagePercent >= 75) statusClass = 'status-warning';
+
+                    // Update storage info
+                    document.getElementById('storage-info').innerHTML =
+                        `<span class="${{statusClass}}">${{sizeGB}}GB / ${{maxSizeGB}}GB</span> (${{data.journal_log_count.toLocaleString()}} logs, ${{data.process_metric_count.toLocaleString()}} metrics)`;
+
+                    // Update retention info
+                    document.getElementById('retention-info').textContent =
+                        `${{data.retention_policy.log_retention_days}}d logs / ${{data.retention_policy.process_retention_days}}d proc`;
+
+                }} catch (error) {{
+                    console.error('Failed to fetch storage health:', error);
+                    document.getElementById('storage-info').innerHTML = '<span class="status-critical">Error loading</span>';
+                    document.getElementById('retention-info').textContent = 'N/A';
+                }}
+            }}
+
+            // Update on load
+            await updateStorageHealth();
+
+            // Refresh every 30 seconds
+            setInterval(updateStorageHealth, 30000);
+        }})();
     </script>
 </body>
 </html>"##,
@@ -1875,7 +1977,8 @@ fn create_test_app(data_dir: &str) -> Router {
     let process_monitor = Arc::new(ProcessMonitor::new());
     let settings = Settings::default();
     let state = Arc::new(
-        AppState::new(data_dir, process_monitor, settings).expect("Failed to create test app state"),
+        AppState::new(data_dir, process_monitor, settings)
+            .expect("Failed to create test app state"),
     );
     Router::new()
         .route("/", get(search_ui))

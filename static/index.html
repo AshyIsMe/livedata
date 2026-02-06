@@ -9,39 +9,54 @@
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             max-width: 1400px;
             margin: 0 auto;
-            padding: 40px 20px;
+            padding: 0;
             background-color: #f5f5f5;
         }
-        
+
+        header {
+            background: white;
+            border-bottom: 2px solid #007bff;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+
+        header nav {
+            display: flex;
+            gap: 5px;
+            padding: 15px 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header nav a {
+            color: #007bff;
+            text-decoration: none;
+            font-size: 16px;
+            font-weight: 500;
+            padding: 10px 18px;
+            border-radius: 4px;
+            transition: background-color 0.2s;
+        }
+
+        header nav a:hover {
+            background-color: #f0f0f0;
+        }
+
+        header nav a.active {
+            background-color: #007bff;
+            color: white;
+        }
+
+        .container {
+            padding: 0 20px 40px;
+        }
+
         h1 {
             color: #333;
             margin-bottom: 30px;
         }
-        
-        nav {
-            background: white;
-            padding: 20px;
-            border-radius: 4px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        
-        nav a {
-            display: inline-block;
-            color: #007bff;
-            text-decoration: none;
-            font-size: 18px;
-            padding: 10px 15px;
-            border-radius: 4px;
-            transition: background-color 0.2s;
-        }
-        
-        nav a:hover {
-            background-color: #f0f0f0;
-            text-decoration: underline;
-        }
-        
+
         .description {
-            margin-top: 30px;
             padding: 20px;
             background: white;
             border-radius: 4px;
@@ -49,18 +64,99 @@
             color: #666;
             line-height: 1.6;
         }
+
+        #storage-health {
+            margin-bottom: 20px;
+            padding: 15px 20px;
+            background: white;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            font-size: 14px;
+            color: #555;
+        }
+
+        #storage-health .health-item {
+            display: inline-block;
+            margin-right: 25px;
+        }
+
+        #storage-health .health-label {
+            font-weight: 600;
+            margin-right: 5px;
+        }
+
+        #storage-health .status-good { color: #28a745; }
+        #storage-health .status-warning { color: #ffc107; }
+        #storage-health .status-critical { color: #dc3545; }
     </style>
 </head>
 <body>
-    <h1>livedata</h1>
-    
-    <nav>
-        <a href="/processes.html">Process Monitor</a>
-    </nav>
-    
-    <div class="description">
-        <p>System observability without infrastructure overhead — download, run, and understand what's happening.</p>
-        <p>Use the navigation above to access different monitoring views.</p>
+    <header>
+        <nav>
+            <a href="/" target="_blank" class="active">Log Search</a>
+            <a href="/processes.html" target="_blank">Processes</a>
+        </nav>
+    </header>
+
+    <div class="container">
+        <div id="storage-health">
+            <span class="health-item">
+                <span class="health-label">Storage:</span>
+                <span id="storage-info">Loading...</span>
+            </span>
+            <span class="health-item">
+                <span class="health-label">Retention:</span>
+                <span id="retention-info">Loading...</span>
+            </span>
+        </div>
+
+        <h1>livedata</h1>
+
+        <div class="description">
+            <p>System observability without infrastructure overhead — download, run, and understand what's happening.</p>
+            <p>Use the navigation above to access different monitoring views.</p>
+        </div>
     </div>
+
+    <script>
+        // Fetch and display storage health
+        async function updateStorageHealth() {
+            try {
+                const response = await fetch('/api/storage/health');
+                if (!response.ok) throw new Error('Failed to fetch storage health');
+
+                const data = await response.json();
+
+                // Calculate storage usage percentage
+                const sizeGB = (data.database_size_bytes / (1024 * 1024 * 1024)).toFixed(2);
+                const maxSizeGB = Math.max(data.retention_policy.log_max_size_gb, data.retention_policy.process_max_size_gb);
+                const usagePercent = (parseFloat(sizeGB) / maxSizeGB) * 100;
+
+                // Determine status color
+                let statusClass = 'status-good';
+                if (usagePercent >= 90) statusClass = 'status-critical';
+                else if (usagePercent >= 75) statusClass = 'status-warning';
+
+                // Update storage info
+                document.getElementById('storage-info').innerHTML =
+                    `<span class="${statusClass}">${sizeGB}GB / ${maxSizeGB}GB</span> (${data.journal_log_count.toLocaleString()} logs, ${data.process_metric_count.toLocaleString()} metrics)`;
+
+                // Update retention info
+                document.getElementById('retention-info').textContent =
+                    `${data.retention_policy.log_retention_days}d logs / ${data.retention_policy.process_retention_days}d proc`;
+
+            } catch (error) {
+                console.error('Failed to fetch storage health:', error);
+                document.getElementById('storage-info').innerHTML = '<span class="status-critical">Error loading</span>';
+                document.getElementById('retention-info').textContent = 'N/A';
+            }
+        }
+
+        // Update on load
+        updateStorageHealth();
+
+        // Refresh every 30 seconds
+        setInterval(updateStorageHealth, 30000);
+    </script>
 </body>
 </html>
