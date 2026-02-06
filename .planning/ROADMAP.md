@@ -12,8 +12,8 @@ Builds on existing log collection infrastructure to add process monitoring, conf
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Process Monitoring Core** - Add process collection and web interface
-- [ ] **Phase 2: Storage Enhancements** - Configurable retention and schema evolution
+- [x] **Phase 1: Process Monitoring Core** - Add process collection and web interface
+- [x] **Phase 2: Storage Enhancements** - Configurable retention and schema evolution
 - [ ] **Phase 3: Zero-Config Improvements** - Auto-detection and sensible defaults
 
 ## Phase Details
@@ -32,7 +32,7 @@ Plans:
 - [x] 01-01-PLAN.md — Backend process collection with sysinfo and API endpoint
 - [x] 01-02-PLAN.md — CLI integration and ApplicationController wiring
 - [x] 01-03-PLAN.md — Frontend process table with search and auto-refresh
-- [ ] 01-04-PLAN.md — End-to-end verification checkpoint
+- [x] 01-04-PLAN.md — End-to-end verification checkpoint
 
 ### Phase 2: Storage Enhancements
 **Goal**: Users can control data retention and schema changes
@@ -42,12 +42,13 @@ Plans:
   1. User can configure data retention period (e.g., 7 days, 30 days, custom) via CLI flag or config file
   2. Application automatically deletes expired data based on retention policy
   3. Storage layer handles schema evolution without breaking existing data or requiring manual migration
-**Plans**: TBD
+**Plans**: 4 plans
 
 Plans:
-- [ ] 02-01: Configurable data retention policy implementation
-- [ ] 02-02: Automatic data cleanup for expired records
-- [ ] 02-03: Schema versioning and backward compatibility layer
+- [x] 02-01-PLAN.md — Configuration and Schema Migration Foundation
+- [x] 02-02-PLAN.md — Data Retention & Cleanup Implementation
+- [x] 02-03-PLAN.md — Process Metrics Persistence & Storage Health API
+- [x] 02-04-PLAN.md — UI Navigation & Storage Health Visibility
 
 ### Phase 3: Zero-Config Improvements
 **Goal**: Application works out of the box with sensible defaults
@@ -71,6 +72,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Process Monitoring Core | 3/4 | In progress | 2026-02-02 |
-| 2. Storage Enhancements | 0/TBD | Not started | - |
+| 1. Process Monitoring Core | 4/4 | Complete | 2026-02-02 |
+| 2. Storage Enhancements | 4/4 | Complete | 2026-02-06 |
 | 3. Zero-Config Improvements | 0/TBD | Not started | - |

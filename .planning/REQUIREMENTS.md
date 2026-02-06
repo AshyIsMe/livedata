@@ -23,14 +23,14 @@
 
 ### Process Monitoring
 
-- [ ] **PROCE-01**: User can view list of running processes with PID, name, CPU percentage, memory percentage, user, and runtime
-- [ ] **PROCE-02**: User can search/filter processes using fuzzy search (fzf-style)
-- [ ] **PROCE-03**: Process data is collected at configurable intervals
+- [x] **PROCE-01**: User can view list of running processes with PID, name, CPU percentage, memory percentage, user, and runtime
+- [x] **PROCE-02**: User can search/filter processes using fuzzy search (fzf-style)
+- [x] **PROCE-03**: Process data is collected at configurable intervals
 
 ### Data Storage
 
-- [ ] **STOR-02**: Data retention is configurable by user
-- [ ] **STOR-03**: Storage layer handles schema evolution for backward compatibility
+- [x] **STOR-02**: Data retention is configurable by user
+- [x] **STOR-03**: Storage layer handles schema evolution for backward compatibility
 
 ### Deployment
 
@@ -113,11 +113,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SEARCH-02 | Existing | Complete |
 | DEPL-01 | Existing | Complete |
 | DEPL-03 | Existing | Complete |
-| PROCE-01 | Phase 1 | Pending |
-| PROCE-02 | Phase 1 | Pending |
-| PROCE-03 | Phase 1 | Pending |
-| STOR-02 | Phase 2 | Pending |
-| STOR-03 | Phase 2 | Pending |
+| PROCE-01 | Phase 1 | Complete |
+| PROCE-02 | Phase 1 | Complete |
+| PROCE-03 | Phase 1 | Complete |
+| STOR-02 | Phase 2 | Complete |
+| STOR-03 | Phase 2 | Complete |
 | DEPL-02 | Phase 3 | Pending |
 
 **Coverage:**
