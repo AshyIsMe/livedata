@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use sysinfo::{ProcessesToUpdate, System};
 use tokio::sync::mpsc;
@@ -27,7 +28,8 @@ pub struct ProcessMetricsBatch {
 pub struct ProcessMonitor {
     system: Arc<Mutex<System>>,
     snapshot: Arc<Mutex<Vec<ProcessInfo>>>,
-    metrics_tx: Option<mpsc::Sender<ProcessMetricsBatch>>,
+    metrics_tx: Arc<Mutex<Option<mpsc::Sender<ProcessMetricsBatch>>>>,
+    shutdown_signal: Arc<AtomicBool>,
 }
 
 impl Default for ProcessMonitor {
@@ -45,28 +47,34 @@ impl ProcessMonitor {
         Self {
             system: Arc::new(Mutex::new(system)),
             snapshot: Arc::new(Mutex::new(Vec::new())),
-            metrics_tx: None,
+            metrics_tx: Arc::new(Mutex::new(None)),
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Initialize with a metrics sender for persistence
-    pub fn with_metrics_sender(metrics_tx: mpsc::Sender<ProcessMetricsBatch>) -> Self {
+    pub fn with_metrics_sender(
+        metrics_tx: mpsc::Sender<ProcessMetricsBatch>,
+        shutdown_signal: Arc<AtomicBool>,
+    ) -> Self {
         let mut system = System::new_all();
         system.refresh_all();
 
         Self {
             system: Arc::new(Mutex::new(system)),
             snapshot: Arc::new(Mutex::new(Vec::new())),
-            metrics_tx: Some(metrics_tx),
+            metrics_tx: Arc::new(Mutex::new(Some(metrics_tx))),
+            shutdown_signal,
         }
     }
 
     /// Start background collection task (run once at startup)
     /// Spawns a dedicated thread with its own tokio runtime for the collection loop
-    pub fn start_collection(&self, interval_secs: u64) {
+    pub fn start_collection(&self, interval_secs: u64) -> std::thread::JoinHandle<()> {
         let system = self.system.clone();
         let snapshot = self.snapshot.clone();
         let metrics_tx = self.metrics_tx.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
 
         std::thread::spawn(move || {
             // Create a local tokio runtime for this thread
@@ -76,7 +84,17 @@ impl ProcessMonitor {
                 let mut ticker = interval(Duration::from_secs(interval_secs));
 
                 loop {
+                    if shutdown_signal.load(Ordering::Relaxed) {
+                        log::info!("Process monitor shutting down");
+                        break;
+                    }
+
                     ticker.tick().await;
+
+                    if shutdown_signal.load(Ordering::Relaxed) {
+                        log::info!("Process monitor shutting down");
+                        break;
+                    }
 
                     let mut sys = system.lock().unwrap();
                     sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -98,7 +116,8 @@ impl ProcessMonitor {
                     *snapshot.lock().unwrap() = processes.clone();
 
                     // Send batch to persistence channel if available
-                    if let Some(ref tx) = metrics_tx {
+                    let tx = metrics_tx.lock().unwrap().as_ref().cloned();
+                    if let Some(tx) = tx {
                         let batch = ProcessMetricsBatch {
                             processes: processes.clone(),
                             timestamp: Utc::now(),
@@ -118,7 +137,12 @@ impl ProcessMonitor {
                     }
                 }
             });
-        });
+        })
+    }
+
+    /// Close the metrics sender so the receiver can exit cleanly.
+    pub fn shutdown_metrics_channel(&self) {
+        *self.metrics_tx.lock().unwrap() = None;
     }
 
     /// Get current process snapshot (called by API handler)

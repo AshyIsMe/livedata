@@ -22,6 +22,9 @@ pub struct ApplicationController {
     hostname: String,
     shutdown_signal: Arc<AtomicBool>,
     process_monitor: Arc<ProcessMonitor>,
+    process_monitor_handle: Option<thread::JoinHandle<()>>,
+    metrics_receiver_handle: Option<thread::JoinHandle<()>>,
+    cleanup_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ApplicationController {
@@ -32,20 +35,24 @@ impl ApplicationController {
     ) -> Result<Self> {
         info!("Initializing Application Controller");
 
+        let shutdown_signal = Arc::new(AtomicBool::new(false));
+
         // Backup database before any migrations
         Self::backup_database(&data_dir)?;
 
         let journal_reader = JournalLogReader::new()?;
         let buffer = DuckDBBuffer::new(&data_dir)?;
         let hostname = gethostname().to_str().unwrap_or("unknown").to_string();
-        let shutdown_signal = Arc::new(AtomicBool::new(false));
 
         // Create mpsc channel for process metrics
         let (metrics_tx, mut metrics_rx) = mpsc::channel::<ProcessMetricsBatch>(32);
 
         // Create process monitor with metrics sender
-        let process_monitor = Arc::new(ProcessMonitor::with_metrics_sender(metrics_tx));
-        process_monitor.start_collection(process_interval);
+        let process_monitor = Arc::new(ProcessMonitor::with_metrics_sender(
+            metrics_tx,
+            shutdown_signal.clone(),
+        ));
+        let process_monitor_handle = process_monitor.start_collection(process_interval);
         info!(
             "Started process monitoring with {}s interval",
             process_interval
@@ -55,7 +62,7 @@ impl ApplicationController {
         let db_path = buffer.db_path().to_path_buf();
 
         // Spawn dedicated receiver task in a thread to persist process metrics
-        thread::spawn(move || {
+        let metrics_receiver_handle = thread::spawn(move || {
             // Create tokio runtime for this thread
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
@@ -116,6 +123,12 @@ impl ApplicationController {
                         info!("Successfully persisted {} process metrics", process_count);
                     }
                 }
+
+                if let Err(e) = conn.execute("CHECKPOINT", []) {
+                    error!("Failed to checkpoint process metrics connection: {}", e);
+                }
+
+                info!("Process metrics receiver task shutting down");
             });
         });
 
@@ -123,7 +136,7 @@ impl ApplicationController {
         info!("Using on-disk DuckDB at: {}", buffer.db_path().display());
 
         // Spawn background cleanup task
-        Self::spawn_cleanup_task(
+        let cleanup_handle = Self::spawn_cleanup_task(
             buffer.db_path().to_path_buf(),
             settings.clone(),
             shutdown_signal.clone(),
@@ -135,6 +148,9 @@ impl ApplicationController {
             hostname,
             shutdown_signal,
             process_monitor,
+            process_monitor_handle: Some(process_monitor_handle),
+            metrics_receiver_handle: Some(metrics_receiver_handle),
+            cleanup_handle: Some(cleanup_handle),
         })
     }
 
@@ -157,7 +173,11 @@ impl ApplicationController {
     }
 
     /// Spawn background cleanup task that runs periodically
-    fn spawn_cleanup_task(db_path: PathBuf, settings: Settings, shutdown_signal: Arc<AtomicBool>) {
+    fn spawn_cleanup_task(
+        db_path: PathBuf,
+        settings: Settings,
+        shutdown_signal: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
         let interval_secs = settings.cleanup_interval_minutes * 60;
 
         info!(
@@ -170,28 +190,36 @@ impl ApplicationController {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(interval_secs as u64));
+                let interval = Duration::from_secs(interval_secs as u64);
 
-                // First tick fires immediately
-                interval.tick().await;
-
-                loop {
-                    // Run cleanup cycle uninterrupted
+                // Run first cleanup immediately.
+                if !shutdown_signal.load(Ordering::Relaxed) {
                     if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
                         error!("Cleanup cycle failed: {}", e);
                     }
+                }
 
-                    // Check shutdown signal AFTER cleanup completes
+                let mut next_run = tokio::time::Instant::now() + interval;
+
+                loop {
                     if shutdown_signal.load(Ordering::Relaxed) {
                         info!("Cleanup task shutting down");
                         break;
                     }
 
-                    // Wait for next interval
-                    interval.tick().await;
+                    let now = tokio::time::Instant::now();
+                    if now >= next_run {
+                        if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
+                            error!("Cleanup cycle failed: {}", e);
+                        }
+                        next_run = tokio::time::Instant::now() + interval;
+                    }
+
+                    // Short sleep so shutdown can interrupt promptly.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             });
-        });
+        })
     }
 
     /// Run a single cleanup cycle (uninterruptible)
@@ -345,6 +373,32 @@ impl ApplicationController {
     fn graceful_shutdown(&mut self) -> Result<()> {
         info!("Starting graceful shutdown");
 
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        self.process_monitor.shutdown_metrics_channel();
+
+        if let Some(handle) = self.process_monitor_handle.take() {
+            if let Err(e) = handle.join() {
+                warn!("Failed to join process monitor thread: {:?}", e);
+            }
+        }
+
+        if let Some(handle) = self.metrics_receiver_handle.take() {
+            if let Err(e) = handle.join() {
+                warn!("Failed to join metrics receiver thread: {:?}", e);
+            }
+        }
+
+        if let Some(handle) = self.cleanup_handle.take() {
+            if let Err(e) = handle.join() {
+                warn!("Failed to join cleanup thread: {:?}", e);
+            }
+        }
+
+        if let Err(e) = self.buffer.conn.execute("CHECKPOINT", []) {
+            warn!("Failed to checkpoint database during shutdown: {}", e);
+        }
+
         // Log final statistics
         self.log_final_statistics();
 
@@ -452,5 +506,26 @@ mod tests {
         assert_eq!(status.total_entries, 0);
         assert_eq!(status.distinct_minutes_count, 0);
         assert!(!status.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_graceful_shutdown_allows_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = Settings::default();
+        let mut controller = ApplicationController::new(temp_dir.path(), 1, settings).unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        controller.graceful_shutdown().unwrap();
+
+        let db_path = temp_dir.path().join("livedata.duckdb");
+        let conn = duckdb::Connection::open(&db_path);
+        assert!(conn.is_ok());
+
+        let conn = conn.unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert!(count >= 0);
     }
 }
