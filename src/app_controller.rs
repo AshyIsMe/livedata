@@ -258,9 +258,11 @@ impl ApplicationController {
             for signal in &mut signals {
                 match signal {
                     SIGINT | signal_hook::consts::SIGTERM => {
-                        info!("Received shutdown signal: {}", signal);
-                        shutdown_signal.store(true, Ordering::Relaxed);
-                        break;
+                        if shutdown_signal.swap(true, Ordering::Relaxed) {
+                            info!("Received shutdown signal {}, shutdown already in progress", signal);
+                        } else {
+                            info!("Received shutdown signal: {}", signal);
+                        }
                     }
                     _ => {}
                 }
