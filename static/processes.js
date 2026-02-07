@@ -6,14 +6,40 @@ let allProcesses = [];
 let debounceTimer;
 const DEBOUNCE_MS = 300;
 let autoRefreshInterval;
+let Tabulator;
+
+async function loadTabulator() {
+    const sources = [
+        "https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator_esm.min.js",
+        "https://cdn.jsdelivr.net/npm/tabulator-tables@6.3.1/dist/js/tabulator_esm.min.js",
+    ];
+
+    let lastError;
+    for (const src of sources) {
+        try {
+            const mod = await import(src);
+            if (mod && mod.TabulatorFull) {
+                return mod.TabulatorFull;
+            }
+            if (mod && mod.default) {
+                return mod.default;
+            }
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    throw lastError || new Error("Unable to load Tabulator module");
+}
 
 // Initialize on DOMContentLoaded
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     console.log('[ProcessMonitor] DOM loaded, starting initialization...');
     
-    // Check if Tabulator is available
-    if (typeof Tabulator === 'undefined') {
-        console.error('[ProcessMonitor] Tabulator library not loaded!');
+    try {
+        Tabulator = await loadTabulator();
+    } catch (error) {
+        console.error('[ProcessMonitor] Tabulator library not loaded!', error);
         showError('Failed to load Tabulator table library. Please refresh the page.');
         return;
     }
