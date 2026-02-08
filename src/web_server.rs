@@ -1,5 +1,5 @@
 use crate::config::Settings;
-use crate::process_monitor::{ProcessInfo, ProcessMonitor};
+use crate::process_monitor::ProcessMonitor;
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -167,9 +167,21 @@ pub struct HealthResponse {
 /// Process list API response
 #[derive(Debug, Serialize)]
 pub struct ProcessResponse {
-    pub processes: Vec<ProcessInfo>,
+    pub processes: Vec<ProcessMetricsRow>,
     pub timestamp: String,
     pub total: usize,
+}
+
+/// Process metrics row for API response (aligned with process_metrics table)
+#[derive(Debug, Serialize)]
+pub struct ProcessMetricsRow {
+    pub timestamp: String,
+    pub pid: u32,
+    pub name: String,
+    pub cpu_usage: f32,
+    pub mem_usage: f64,
+    pub user: Option<String>,
+    pub runtime: u64,
 }
 
 /// Storage health API response
@@ -336,12 +348,34 @@ async fn serve_processes_js() -> impl IntoResponse {
 async fn api_processes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProcessResponse>, (StatusCode, String)> {
-    let processes = state.process_monitor.get_snapshot();
+    let snapshot = state.process_monitor.get_snapshot();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let processes: Vec<ProcessMetricsRow> = snapshot
+        .into_iter()
+        .map(|process| {
+            let user = process.user_id.as_ref().and_then(|uid_str| {
+                uid_str
+                    .strip_prefix("Uid(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .map(|s| s.to_string())
+            });
+
+            ProcessMetricsRow {
+                timestamp: timestamp.clone(),
+                pid: process.pid,
+                name: process.name,
+                cpu_usage: process.cpu_percent,
+                mem_usage: process.memory_bytes as f64,
+                user,
+                runtime: process.runtime_secs,
+            }
+        })
+        .collect();
     let total = processes.len();
 
     Ok(Json(ProcessResponse {
         processes,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp,
         total,
     }))
 }

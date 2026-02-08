@@ -73,10 +73,16 @@ function initializeTable() {
     
     table = new Tabulator("#processes-table", {
         layout: "fitColumns",
-        initialSort: [{ column: "cpu_percent", dir: "desc" }],
+        initialSort: [{ column: "cpu_usage", dir: "desc" }],
         placeholder: "No processes found",
         data: [], // Start with empty data
         columns: [
+            { 
+                title: "Timestamp", 
+                field: "timestamp_display", 
+                sorter: "string",
+                minWidth: 180
+            },
             { 
                 title: "PID", 
                 field: "pid", 
@@ -91,7 +97,7 @@ function initializeTable() {
             },
             { 
                 title: "CPU %", 
-                field: "cpu_percent", 
+                field: "cpu_usage", 
                 sorter: "number",
                 formatter: (cell) => {
                     const val = cell.getValue();
@@ -99,6 +105,41 @@ function initializeTable() {
                 },
                 width: 120,
                 hozAlign: "right"
+            },
+            { 
+                title: "Memory (Bytes)", 
+                field: "mem_usage", 
+                sorter: "number",
+                formatter: (cell) => {
+                    const val = cell.getValue();
+                    return val !== null && val !== undefined ? formatBytes(val) : "-";
+                },
+                width: 120,
+                hozAlign: "right"
+            },
+            { 
+                title: "User", 
+                field: "user", 
+                sorter: "string",
+                width: 150,
+                formatter: (cell) => {
+                    const val = cell.getValue();
+                    if (!val) return "-";
+                    // Extract numeric UID from "Uid(1234)" format
+                    const match = String(val).match(/Uid\((\d+)\)/);
+                    return match ? match[1] : val;
+                }
+            },
+            { 
+                title: "Runtime (s)", 
+                field: "runtime", 
+                sorter: "number",
+                width: 130,
+                hozAlign: "right",
+                formatter: (cell) => {
+                    const val = cell.getValue();
+                    return val !== null && val !== undefined ? String(val) : "-";
+                }
             },
             { 
                 title: "Memory %", 
@@ -110,19 +151,6 @@ function initializeTable() {
                 },
                 width: 120,
                 hozAlign: "right"
-            },
-            { 
-                title: "User", 
-                field: "user_id", 
-                sorter: "string",
-                width: 150,
-                formatter: (cell) => {
-                    const val = cell.getValue();
-                    if (!val) return "-";
-                    // Extract numeric UID from "Uid(1234)" format
-                    const match = String(val).match(/Uid\((\d+)\)/);
-                    return match ? match[1] : val;
-                }
             },
             { 
                 title: "Runtime", 
@@ -201,13 +229,15 @@ async function fetchProcesses() {
         
         // Process data - calculate derived fields
         allProcesses = data.processes.map(proc => {
-            const memoryPercent = calculateMemoryPercent(proc.memory_bytes);
-            const runtimeDisplay = formatRuntime(proc.runtime_secs);
+            const memoryPercent = calculateMemoryPercent(proc.mem_usage);
+            const runtimeDisplay = formatRuntime(proc.runtime);
+            const timestampDisplay = formatTimestamp(proc.timestamp);
             
             return { 
                 ...proc, 
                 memory_percent: memoryPercent, 
-                runtime_display: runtimeDisplay 
+                runtime_display: runtimeDisplay,
+                timestamp_display: timestampDisplay
             };
         });
         
@@ -233,6 +263,22 @@ function calculateMemoryPercent(memoryBytes) {
     if (!memoryBytes || memoryBytes === 0) return 0;
     const totalMemoryBytes = 16 * 1024 * 1024 * 1024; // 16GB in bytes
     return (memoryBytes / totalMemoryBytes) * 100;
+}
+
+/**
+ * Format bytes as human-readable string
+ */
+function formatBytes(bytes) {
+    if (bytes === null || bytes === undefined) return "-";
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ["KB", "MB", "GB", "TB", "PB"];
+    let value = bytes;
+    let unitIndex = -1;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+    }
+    return `${value.toFixed(1)} ${units[unitIndex]}`;
 }
 
 /**
@@ -284,7 +330,7 @@ function filterAndDisplay() {
     
     // Fuzzy-ish filter: all query chars must appear in order in searchable text
     const filtered = allProcesses.filter(proc => {
-        const searchText = `${proc.pid} ${proc.name} ${proc.user_id || ''} ${proc.cpu_percent !== undefined ? proc.cpu_percent.toFixed(1) : ''}`.toLowerCase();
+        const searchText = `${proc.pid} ${proc.name} ${proc.user || ''} ${proc.cpu_usage !== undefined ? proc.cpu_usage.toFixed(1) : ''} ${proc.timestamp || ''}`.toLowerCase();
         return fuzzyMatch(query, searchText);
     });
     
@@ -344,6 +390,16 @@ function updateTimestamp(isoTimestamp) {
     if (element) {
         element.textContent = `Updated ${secondsAgo}s ago (${timeString})`;
     }
+}
+
+/**
+ * Format timestamp for table display
+ */
+function formatTimestamp(isoTimestamp) {
+    if (!isoTimestamp) return "-";
+    const date = new Date(isoTimestamp);
+    if (Number.isNaN(date.getTime())) return isoTimestamp;
+    return date.toLocaleString();
 }
 
 /**
