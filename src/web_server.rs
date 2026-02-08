@@ -348,6 +348,50 @@ async fn serve_processes_js() -> impl IntoResponse {
 async fn api_processes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProcessResponse>, (StatusCode, String)> {
+    let latest_timestamp: Option<String> = {
+        let conn = state.conn.lock().unwrap();
+        conn.prepare("SELECT MAX(timestamp) FROM process_metrics")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+            .ok()
+    };
+
+    if let Some(latest_timestamp) = latest_timestamp {
+        let conn = state.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime
+                 FROM process_metrics
+                 WHERE timestamp = ?",
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let rows = stmt
+            .query_map([latest_timestamp.clone()], |row| {
+                Ok(ProcessMetricsRow {
+                    timestamp: row.get(0)?,
+                    pid: row.get::<_, i64>(1)? as u32,
+                    name: row.get(2)?,
+                    cpu_usage: row.get::<_, f64>(3)? as f32,
+                    mem_usage: row.get(4)?,
+                    user: row.get(5)?,
+                    runtime: row.get::<_, i64>(6)? as u64,
+                })
+            })
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut processes = Vec::new();
+        for row in rows {
+            processes.push(row.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
+        }
+
+        let total = processes.len();
+        return Ok(Json(ProcessResponse {
+            processes,
+            timestamp: latest_timestamp,
+            total,
+        }));
+    }
+
     let snapshot = state.process_monitor.get_snapshot();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let processes: Vec<ProcessMetricsRow> = snapshot
