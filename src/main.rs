@@ -55,7 +55,11 @@ struct Args {
 #[derive(Parser, Debug)]
 enum Commands {
     /// Run the web server
-    Web,
+    Web {
+        /// Bind web server to all interfaces (0.0.0.0) instead of localhost
+        #[arg(long)]
+        listen_all: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -117,7 +121,7 @@ fn main() -> Result<()> {
     }
 
     // Check if the web subcommand is present
-    if let Some(Commands::Web) = args.command {
+    if let Some(Commands::Web { listen_all }) = args.command {
         let settings_for_web = settings.clone();
         // Create and run the application in the main thread
         let mut app = ApplicationController::new(&args.data_dir, args.process_interval, settings)?;
@@ -139,6 +143,7 @@ fn main() -> Result<()> {
                 shutdown_signal,
                 process_monitor,
                 settings_for_web,
+                listen_all,
             ));
         });
 

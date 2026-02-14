@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tower_http::trace::TraceLayer;
+use tracing::info;
 
 /// Application state shared across handlers
 pub struct AppState {
@@ -76,6 +78,16 @@ pub struct SearchParams {
     pub columns: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProcessTableParams {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default = "default_process_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
 fn default_start() -> String {
     "-1h".to_string()
 }
@@ -94,6 +106,10 @@ fn default_sort() -> String {
 
 fn default_sort_dir() -> String {
     "desc".to_string()
+}
+
+fn default_process_limit() -> usize {
+    100
 }
 
 /// Search result entry (used for default columns)
@@ -282,26 +298,54 @@ pub async fn run_web_server(
     shutdown_signal: Arc<AtomicBool>,
     process_monitor: Arc<ProcessMonitor>,
     settings: Settings,
+    listen_all: bool,
 ) {
     let state = Arc::new(AppState::new(data_dir, buffer, process_monitor, settings));
 
     let app = Router::new()
         .route("/", get(search_ui))
+        .route("/htmx/logs/chunk", get(htmx_logs_chunk))
         .route("/api/search", get(api_search))
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/api/processes", get(api_processes))
+        .route("/htmx/processes/chunk", get(htmx_processes_chunk))
         .route("/api/storage/health", get(api_storage_health))
         .route("/health", get(health))
         // Static file routes for process monitoring UI
         .route("/index.html", get(serve_index_html))
-        .route("/processes.html", get(serve_processes_html))
-        .route("/processes.js", get(serve_processes_js))
+        .route("/processes.html", get(processes_ui))
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(|request: &axum::http::Request<_>, _span: &tracing::Span| {
+                    info!(
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        query = request.uri().query().unwrap_or(""),
+                        "http request started"
+                    );
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     _span: &tracing::Span| {
+                        info!(
+                            status = response.status().as_u16(),
+                            latency_ms = latency.as_millis(),
+                            "http request completed"
+                        );
+                    },
+                ),
+        )
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
+    let bind_addr = if listen_all {
+        "0.0.0.0:3000"
+    } else {
+        "127.0.0.1:3000"
+    };
+
+    let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     log::info!("Web server listening on {}", listener.local_addr().unwrap());
 
     // Run axum server with graceful shutdown
@@ -336,26 +380,27 @@ async fn serve_index_html() -> impl IntoResponse {
     }
 }
 
-/// Serve processes.html static file
-async fn serve_processes_html() -> impl IntoResponse {
-    match tokio::fs::read_to_string("static/processes.html").await {
-        Ok(content) => Html(content).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "processes.html not found").into_response(),
-    }
-}
-
-/// Serve processes.js static file
-async fn serve_processes_js() -> impl IntoResponse {
-    match tokio::fs::read_to_string("static/processes.js").await {
-        Ok(content) => ([("content-type", "application/javascript")], content).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "processes.js not found").into_response(),
-    }
+/// Serve process monitor page rendered with HTMX table fragments
+async fn processes_ui() -> impl IntoResponse {
+    Html(build_processes_html())
 }
 
 /// API endpoint returning current process snapshot
 async fn api_processes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProcessResponse>, (StatusCode, String)> {
+    let (processes, timestamp) = get_current_process_rows(&state)?;
+    let total = processes.len();
+    Ok(Json(ProcessResponse {
+        processes,
+        timestamp,
+        total,
+    }))
+}
+
+fn get_current_process_rows(
+    state: &Arc<AppState>,
+) -> Result<(Vec<ProcessMetricsRow>, String), (StatusCode, String)> {
     let latest_timestamp = state
         .buffer
         .lock()
@@ -373,13 +418,7 @@ async fn api_processes(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let processes: Vec<ProcessMetricsRow> = rows.into_iter().map(to_process_row).collect();
-
-        let total = processes.len();
-        return Ok(Json(ProcessResponse {
-            processes,
-            timestamp: latest_timestamp,
-            total,
-        }));
+        return Ok((processes, latest_timestamp));
     }
 
     let snapshot = state.process_monitor.get_snapshot();
@@ -405,13 +444,7 @@ async fn api_processes(
             }
         })
         .collect();
-    let total = processes.len();
-
-    Ok(Json(ProcessResponse {
-        processes,
-        timestamp,
-        total,
-    }))
+    Ok((processes, timestamp))
 }
 
 /// API endpoint returning storage health and statistics
@@ -444,6 +477,181 @@ async fn api_storage_health(
         newest_log_timestamp: stats.newest_log_timestamp,
         retention_policy,
     }))
+}
+
+async fn htmx_logs_chunk(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> impl IntoResponse {
+    match query_log_results(&state, &params) {
+        Ok((results, display_names, total_count)) => Html(render_log_chunk_fragment(
+            &params,
+            &results,
+            &display_names,
+            total_count,
+        ))
+        .into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+async fn htmx_processes_chunk(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ProcessTableParams>,
+) -> impl IntoResponse {
+    let (mut processes, timestamp) = match get_current_process_rows(&state) {
+        Ok(data) => data,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+
+    processes.sort_by(|a, b| b.cpu_usage.total_cmp(&a.cpu_usage));
+
+    if let Some(q) = params.q.as_deref()
+        && !q.trim().is_empty()
+    {
+        let needle = q.to_lowercase();
+        processes.retain(|p| {
+            let haystack = format!(
+                "{} {} {} {:.1} {}",
+                p.pid,
+                p.name,
+                p.user.as_deref().unwrap_or(""),
+                p.cpu_usage,
+                p.timestamp
+            )
+            .to_lowercase();
+            fuzzy_match(&needle, &haystack)
+        });
+    }
+
+    let total_count = processes.len();
+    let limit = params.limit.clamp(10, 1000);
+    let start = params.offset.min(total_count);
+    let end = (start + limit).min(total_count);
+    let page = &processes[start..end];
+
+    Html(render_process_chunk_fragment(
+        &params,
+        page,
+        total_count,
+        &timestamp,
+    ))
+    .into_response()
+}
+
+fn query_log_results(
+    state: &Arc<AppState>,
+    params: &SearchParams,
+) -> Result<(Vec<serde_json::Value>, Vec<String>, usize), (StatusCode, String)> {
+    let now = Utc::now();
+    let start = parse_time(&params.start, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let end = parse_time(&params.end, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let limit = params.limit.min(100_000);
+
+    let schema = get_schema_columns(&state.buffer);
+    if schema.is_empty() {
+        return Ok((
+            Vec::new(),
+            DEFAULT_COLUMNS
+                .iter()
+                .map(|c| column_display_name(c))
+                .collect(),
+            0,
+        ));
+    }
+
+    let requested_cols: Vec<&str> = if let Some(ref cols) = params.columns
+        && !cols.is_empty()
+    {
+        cols.split(',').map(|s| s.trim()).collect()
+    } else {
+        DEFAULT_COLUMNS.to_vec()
+    };
+    let select_exprs = validate_columns(&requested_cols, &schema);
+    let select_list = if select_exprs.is_empty() {
+        DEFAULT_COLUMNS
+            .iter()
+            .filter_map(|c| {
+                let exprs = validate_columns(&[c], &schema);
+                exprs.into_iter().next()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        select_exprs
+    };
+    let display_names: Vec<String> = select_list.iter().map(|e| column_display_name(e)).collect();
+
+    let mut where_sql = format!(
+        "timestamp >= '{}' AND timestamp < '{}'",
+        start.to_rfc3339(),
+        end.to_rfc3339()
+    );
+
+    if let Some(ref q) = params.q
+        && !q.is_empty()
+    {
+        let escaped = escape_like(q);
+        where_sql.push_str(&format!(" AND message ILIKE '%{}%' ESCAPE '\\'", escaped));
+    }
+    if let Some(ref hostname) = params.hostname
+        && !hostname.is_empty()
+    {
+        let hosts: Vec<&str> = hostname.split(',').collect();
+        let host_list: Vec<String> = hosts
+            .iter()
+            .map(|h| format!("'{}'", h.replace('\'', "''")))
+            .collect();
+        where_sql.push_str(&format!(" AND _hostname IN ({})", host_list.join(",")));
+    }
+    if let Some(ref unit) = params.unit
+        && !unit.is_empty()
+    {
+        let units: Vec<&str> = unit.split(',').collect();
+        let unit_list: Vec<String> = units
+            .iter()
+            .map(|u| format!("'{}'", u.replace('\'', "''")))
+            .collect();
+        where_sql.push_str(&format!(" AND _systemd_unit IN ({})", unit_list.join(",")));
+    }
+    if let Some(priority) = params.priority {
+        where_sql.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
+    }
+
+    let sort_column = match params.sort.to_lowercase().as_str() {
+        "timestamp" => "timestamp",
+        "hostname" | "host" => "_hostname",
+        "unit" => "_systemd_unit",
+        "priority" | "pri" => "priority",
+        "comm" => "_comm",
+        _ => "timestamp",
+    };
+
+    let sort_direction = match params.sort_dir.to_lowercase().as_str() {
+        "asc" => "ASC",
+        "desc" => "DESC",
+        _ => "DESC",
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM journal_logs WHERE {}", where_sql);
+    let sql = format!(
+        "SELECT {} FROM journal_logs WHERE {} ORDER BY {} {} LIMIT {} OFFSET {}",
+        select_list.join(", "),
+        where_sql,
+        sort_column,
+        sort_direction,
+        limit,
+        params.offset
+    );
+
+    let total_count = state.buffer.lock().unwrap().query_usize(&count_sql);
+    let results = state
+        .buffer
+        .lock()
+        .unwrap()
+        .query_json_rows(&sql, &display_names)
+        .unwrap_or_default();
+
+    Ok((results, display_names, total_count))
 }
 
 /// Get valid column names from the journal_logs schema
@@ -672,196 +880,8 @@ async fn search_ui(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let now = Utc::now();
-
-    // Parse time range for display
-    let start = parse_time(&params.start, now).unwrap_or(now - Duration::hours(1));
-    let end = parse_time(&params.end, now).unwrap_or(now);
-
-    let limit = params.limit.min(100_000);
-
-    // Determine which columns to select
-    let schema = get_schema_columns(&state.buffer);
-    let requested_cols: Vec<&str> = if let Some(ref cols) = params.columns
-        && !cols.is_empty()
-    {
-        cols.split(',').map(|s| s.trim()).collect()
-    } else {
-        DEFAULT_COLUMNS.to_vec()
-    };
-    let select_exprs = validate_columns(&requested_cols, &schema);
-    let select_list = if select_exprs.is_empty() {
-        DEFAULT_COLUMNS
-            .iter()
-            .filter_map(|c| {
-                let exprs = validate_columns(&[c], &schema);
-                exprs.into_iter().next()
-            })
-            .collect::<Vec<_>>()
-    } else {
-        select_exprs
-    };
-    let display_names: Vec<String> = select_list.iter().map(|e| column_display_name(e)).collect();
-
-    // Get all available columns for the column chooser
-    let all_columns: Vec<ColumnInfo> = schema
-        .iter()
-        .filter(|(name, _)| !EXCLUDED_COLUMNS.contains(&name.as_str()))
-        .map(|(name, col_type)| ColumnInfo {
-            name: name.clone(),
-            column_type: col_type.clone(),
-            default: DEFAULT_COLUMNS.contains(&name.as_str()),
-        })
-        .collect();
-
-    let mut sql = format!(
-        "SELECT {} FROM journal_logs WHERE timestamp >= '{}' AND timestamp < '{}'",
-        select_list.join(", "),
-        start.to_rfc3339(),
-        end.to_rfc3339()
-    );
-
-    // Add text search filter
-    if let Some(ref q) = params.q
-        && !q.is_empty()
-    {
-        let escaped = escape_like(q);
-        sql.push_str(&format!(" AND message ILIKE '%{}%' ESCAPE '\\'", escaped));
-    }
-
-    // Add hostname filter
-    if let Some(ref hostname) = params.hostname
-        && !hostname.is_empty()
-    {
-        let hosts: Vec<&str> = hostname.split(',').collect();
-        let host_list: Vec<String> = hosts
-            .iter()
-            .map(|h| format!("'{}'", h.replace('\'', "''")))
-            .collect();
-        sql.push_str(&format!(" AND _hostname IN ({})", host_list.join(",")));
-    }
-
-    // Add unit filter
-    if let Some(ref unit) = params.unit
-        && !unit.is_empty()
-    {
-        let units: Vec<&str> = unit.split(',').collect();
-        let unit_list: Vec<String> = units
-            .iter()
-            .map(|u| format!("'{}'", u.replace('\'', "''")))
-            .collect();
-        sql.push_str(&format!(" AND _systemd_unit IN ({})", unit_list.join(",")));
-    }
-
-    // Add priority filter
-    if let Some(priority) = params.priority {
-        sql.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
-    }
-
-    // Count total results
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM journal_logs WHERE {}",
-        sql.split("WHERE ")
-            .nth(1)
-            .unwrap_or("1=1")
-            .split(" ORDER BY")
-            .next()
-            .unwrap_or("1=1")
-    );
-
-    // Validate and build ORDER BY clause
-    let sort_column = match params.sort.to_lowercase().as_str() {
-        "timestamp" => "timestamp",
-        "hostname" | "host" => "_hostname",
-        "unit" => "_systemd_unit",
-        "priority" | "pri" => "priority",
-        "comm" => "_comm",
-        _ => "timestamp",
-    };
-
-    let sort_direction = match params.sort_dir.to_lowercase().as_str() {
-        "asc" => "ASC",
-        "desc" => "DESC",
-        _ => "DESC",
-    };
-
-    sql.push_str(&format!(
-        " ORDER BY {} {} LIMIT {} OFFSET {}",
-        sort_column, sort_direction, limit, params.offset
-    ));
-
-    // Get total count
-    let total_count = state.buffer.lock().unwrap().query_usize(&count_sql);
-
-    // Execute main query with dynamic columns
-    let results = state
-        .buffer
-        .lock()
-        .unwrap()
-        .query_json_rows(&sql, &display_names)
-        .unwrap_or_default();
-
-    // Build histogram queries for both minute and hour granularity
-    let mut hist_where = format!(
-        "FROM journal_logs WHERE timestamp >= '{}' AND timestamp < '{}'",
-        start.to_rfc3339(),
-        end.to_rfc3339()
-    );
-
-    if let Some(ref q) = params.q
-        && !q.is_empty()
-    {
-        let escaped = escape_like(q);
-        hist_where.push_str(&format!(" AND message ILIKE '%{}%' ESCAPE '\\'", escaped));
-    }
-    if let Some(ref hostname) = params.hostname
-        && !hostname.is_empty()
-    {
-        let hosts: Vec<&str> = hostname.split(',').collect();
-        let host_list: Vec<String> = hosts
-            .iter()
-            .map(|h| format!("'{}'", h.replace('\'', "''")))
-            .collect();
-        hist_where.push_str(&format!(" AND _hostname IN ({})", host_list.join(",")));
-    }
-    if let Some(ref unit) = params.unit
-        && !unit.is_empty()
-    {
-        let units: Vec<&str> = unit.split(',').collect();
-        let unit_list: Vec<String> = units
-            .iter()
-            .map(|u| format!("'{}'", u.replace('\'', "''")))
-            .collect();
-        hist_where.push_str(&format!(" AND _systemd_unit IN ({})", unit_list.join(",")));
-    }
-    if let Some(priority) = params.priority {
-        hist_where.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
-    }
-
-    let mut histogram_both: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-
-    for bin_unit in &["minute", "hour"] {
-        let hist_sql = format!(
-            "SELECT CAST(date_trunc('{}', timestamp) AS VARCHAR) as bin, COUNT(*) as count {} GROUP BY bin ORDER BY bin",
-            bin_unit, hist_where
-        );
-
-        let rows = state.buffer.lock().unwrap().query_histogram_rows(&hist_sql);
-
-        histogram_both.insert(bin_unit.to_string(), serde_json::Value::Array(rows));
-    }
-
-    let histogram_json = serde_json::to_string(&histogram_both)
-        .unwrap_or_else(|_| "{}".to_string())
-        .replace("</", "<\\/");
-
-    // Pick default bin unit based on range
-    let range_seconds = (end - start).num_seconds();
-    let default_bin = if range_seconds <= 7200 {
-        "minute"
-    } else {
-        "hour"
-    };
+    let (results, display_names, total_count) =
+        query_log_results(&state, &params).unwrap_or_default();
 
     // Get filter options
     let hostnames = state.buffer.lock().unwrap().query_distinct_strings(
@@ -872,21 +892,13 @@ async fn search_ui(
         "SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit",
     );
 
-    // Build HTML
-    let start_iso = start.to_rfc3339();
-    let end_iso = end.to_rfc3339();
     let html = build_search_html(
         &params,
         &results,
         &display_names,
-        &all_columns,
         total_count,
         &hostnames,
         &units,
-        &histogram_json,
-        default_bin,
-        &start_iso,
-        &end_iso,
     );
 
     Html(html)
@@ -897,14 +909,9 @@ fn build_search_html(
     params: &SearchParams,
     results: &[serde_json::Value],
     display_names: &[String],
-    all_columns: &[ColumnInfo],
     total_count: usize,
     hostnames: &[String],
     units: &[String],
-    histogram_json: &str,
-    bin_unit: &str,
-    start_iso: &str,
-    end_iso: &str,
 ) -> String {
     let query_value = params.q.as_deref().unwrap_or("");
     let hostname_value = params.hostname.as_deref().unwrap_or("");
@@ -960,77 +967,7 @@ fn build_search_html(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Calculate pagination
-    let limit = params.limit.min(100_000);
-    let current_page = params.offset / limit + 1;
-    let total_pages = total_count.div_ceil(limit);
-
-    // Build pagination links
-    let pagination = if total_pages > 1 {
-        let mut links = Vec::new();
-
-        // Previous link
-        if current_page > 1 {
-            let prev_offset = (current_page - 2) * limit;
-            links.push(format!(
-                r#"<a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset={}&sort={}&sort_dir={}" class="page-link">&laquo; Prev</a>"#,
-                url_encode(query_value),
-                url_encode(&params.start),
-                url_encode(&params.end),
-                url_encode(hostname_value),
-                url_encode(unit_value),
-                priority_value.map(|p| format!("&priority={}", p)).unwrap_or_default(),
-                limit,
-                prev_offset,
-                url_encode(&params.sort),
-                url_encode(&params.sort_dir),
-            ));
-        }
-
-        // Page info
-        links.push(format!(
-            "<span class=\"page-info\">Page {} of {} ({} results)</span>",
-            current_page, total_pages, total_count
-        ));
-
-        // Next link
-        if current_page < total_pages {
-            let next_offset = current_page * limit;
-            links.push(format!(
-                r#"<a href="?q={}&start={}&end={}&hostname={}&unit={}{}&limit={}&offset={}&sort={}&sort_dir={}" class="page-link">Next &raquo;</a>"#,
-                url_encode(query_value),
-                url_encode(&params.start),
-                url_encode(&params.end),
-                url_encode(hostname_value),
-                url_encode(unit_value),
-                priority_value.map(|p| format!("&priority={}", p)).unwrap_or_default(),
-                limit,
-                next_offset,
-                url_encode(&params.sort),
-                url_encode(&params.sort_dir),
-            ));
-        }
-
-        format!("<div class=\"pagination\">{}</div>", links.join(" "))
-    } else {
-        format!(
-            "<div class=\"pagination\"><span class=\"page-info\">{} results</span></div>",
-            total_count
-        )
-    };
-
-    // Serialize results as JSON for Tabulator
-    let results_json = serde_json::to_string(results)
-        .unwrap_or_else(|_| "[]".to_string())
-        .replace("</", "<\\/");
-
-    // Serialize column info and active display names for the frontend
-    let columns_json = serde_json::to_string(all_columns)
-        .unwrap_or_else(|_| "[]".to_string())
-        .replace("</", "<\\/");
-    let active_columns_json = serde_json::to_string(display_names)
-        .unwrap_or_else(|_| "[]".to_string())
-        .replace("</", "<\\/");
+    let chunk_fragment = render_log_chunk_fragment(params, results, display_names, total_count);
 
     format!(
         r##"<!DOCTYPE html>
@@ -1039,8 +976,7 @@ fn build_search_html(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
-    <link href="https://unpkg.com/tabulator-tables@6.3.1/dist/css/tabulator_midnight.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <style>
         * {{
             box-sizing: border-box;
@@ -1194,11 +1130,17 @@ fn build_search_html(
             background-color: #00d9ff;
             color: #1a1a2e;
         }}
+        .results-table-wrap {{
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            overflow: hidden;
+            background-color: #16213e;
+        }}
         .results-table {{
             width: 100%;
             border-collapse: collapse;
             font-size: 0.9rem;
-            table-layout: fixed;
+            table-layout: auto;
         }}
         .results-table th {{
             background-color: #16213e;
@@ -1207,93 +1149,50 @@ fn build_search_html(
             font-weight: 600;
             color: #00d9ff;
             border-bottom: 2px solid #0f3460;
-            position: sticky;
-            top: 0;
-        }}
-        .results-table th a {{
-            color: #00d9ff;
-            text-decoration: none;
-            display: inline-block;
-            cursor: pointer;
-            user-select: none;
-        }}
-        .results-table th a:hover {{
-            color: #fff;
-            text-decoration: underline;
         }}
         .results-table td {{
             padding: 10px;
             border-bottom: 1px solid #0f3460;
-            vertical-align: top;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            vertical-align: top; 
+            word-break: break-word;
         }}
         .results-table tr:hover {{
             background-color: #16213e;
         }}
-        .results-table .timestamp {{
-            width: 200px;
-            font-family: monospace;
-            white-space: nowrap;
-            color: #888;
-        }}
-        .results-table .priority {{
-            width: 60px;
-            text-align: center;
-        }}
-        .results-table .message {{
-            font-family: monospace;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }}
         .priority-critical {{
             background-color: rgba(255, 0, 0, 0.15);
-        }}
-        .priority-critical .priority {{
-            color: #ff4444;
-            font-weight: bold;
         }}
         .priority-error {{
             background-color: rgba(255, 100, 0, 0.1);
         }}
-        .priority-error .priority {{
-            color: #ff8800;
-        }}
         .priority-warning {{
             background-color: rgba(255, 200, 0, 0.05);
         }}
-        .priority-warning .priority {{
-            color: #ffcc00;
-        }}
-        .pagination {{
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 15px;
-            padding: 20px;
+        .summary {{
+            padding: 12px 16px;
             background-color: #16213e;
-            border-radius: 8px;
-            margin-top: 20px;
-        }}
-        .page-link {{
-            color: #00d9ff;
-            text-decoration: none;
-            padding: 8px 15px;
             border: 1px solid #00d9ff;
-            border-radius: 4px;
-            transition: all 0.2s;
-        }}
-        .page-link:hover {{
-            background-color: #00d9ff;
-            color: #1a1a2e;
-        }}
-        .page-info {{
-            color: #888;
+            border-radius: 8px;
+            color: #b7e7f2;
+            margin-bottom: 12px;
         }}
         .no-results {{
             text-align: center;
             padding: 40px;
             color: #888;
+        }}
+        .load-row {{
+            text-align: center;
+            padding: 14px;
+        }}
+        .load-row button {{
+            border: 1px solid #00d9ff;
+            background: transparent;
+            color: #00d9ff;
+        }}
+        .load-row button:hover {{
+            background: #00d9ff;
+            color: #1a1a2e;
         }}
         .keyboard-hint {{
             color: #666;
@@ -1310,134 +1209,6 @@ fn build_search_html(
             .time-presets {{
                 flex-wrap: wrap;
             }}
-        }}
-        #timechart-container {{
-            background-color: #16213e;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 20px;
-            max-height: 250px;
-        }}
-        #timechart-container canvas {{
-            max-height: 200px;
-        }}
-        #bin-toggle {{
-            display: flex;
-            justify-content: center;
-            gap: 8px;
-            margin-top: 8px;
-        }}
-        .bin-btn {{
-            background-color: #0f3460;
-            color: #00d9ff;
-            border: 1px solid #00d9ff;
-            padding: 4px 14px;
-            border-radius: 4px;
-            font-size: 0.8rem;
-            cursor: pointer;
-            transition: all 0.2s;
-        }}
-        .bin-btn:hover, .bin-btn.active {{
-            background-color: #00d9ff;
-            color: #1a1a2e;
-        }}
-        #results-table {{
-            height: 600px;
-            background-color: #16213e;
-            border-radius: 8px;
-            overflow: hidden;
-        }}
-        .column-chooser-wrapper {{
-            position: relative;
-            display: inline-block;
-        }}
-        .column-chooser-btn {{
-            background-color: #0f3460;
-            color: #00d9ff;
-            border: 1px solid #00d9ff;
-            padding: 8px 14px;
-            border-radius: 4px;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: all 0.2s;
-        }}
-        .column-chooser-btn:hover {{
-            background-color: #00d9ff;
-            color: #1a1a2e;
-        }}
-        .column-chooser-panel {{
-            display: none;
-            position: absolute;
-            top: 100%;
-            left: 0;
-            z-index: 100;
-            background-color: #16213e;
-            border: 1px solid #0f3460;
-            border-radius: 8px;
-            padding: 12px;
-            min-width: 250px;
-            max-height: 400px;
-            overflow-y: auto;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-        }}
-        .column-chooser-panel.open {{
-            display: block;
-        }}
-        .column-chooser-panel label {{
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 4px 0;
-            color: #ccc;
-            font-size: 0.85rem;
-            cursor: pointer;
-        }}
-        .column-chooser-panel label:hover {{
-            color: #fff;
-        }}
-        .column-chooser-panel input[type="checkbox"] {{
-            accent-color: #00d9ff;
-            width: 16px;
-            height: 16px;
-        }}
-        .column-chooser-panel .col-type {{
-            color: #666;
-            font-size: 0.75rem;
-            margin-left: auto;
-        }}
-        .column-chooser-panel .col-actions {{
-            display: flex;
-            gap: 8px;
-            margin-top: 8px;
-            padding-top: 8px;
-            border-top: 1px solid #0f3460;
-        }}
-        .column-chooser-panel .col-actions button {{
-            flex: 1;
-            padding: 6px 10px;
-            font-size: 0.8rem;
-        }}
-        .tabulator {{
-            background-color: #16213e;
-            border: none;
-            border-radius: 8px;
-        }}
-        .tabulator .tabulator-header {{
-            background-color: #16213e;
-            border-bottom: 2px solid #0f3460;
-        }}
-        .tabulator .tabulator-header .tabulator-col {{
-            background-color: #16213e;
-            border-right-color: #0f3460;
-        }}
-        .tabulator .tabulator-header .tabulator-col .tabulator-col-title {{
-            color: #00d9ff;
-        }}
-        .tabulator .tabulator-tableholder .tabulator-table .tabulator-row {{
-            border-bottom: 1px solid #0f3460;
-        }}
-        .tabulator .tabulator-tableholder .tabulator-table .tabulator-row .tabulator-cell {{
-            border-right-color: #0f3460;
         }}
     </style>
 </head>
@@ -1471,13 +1242,6 @@ fn build_search_html(
                 <div class="form-group">
                     <label>&nbsp;</label>
                     <button type="submit">Search</button>
-                </div>
-                <div class="form-group">
-                    <label>&nbsp;</label>
-                    <div class="column-chooser-wrapper">
-                        <button type="button" class="column-chooser-btn" id="col-chooser-toggle">Columns</button>
-                        <div class="column-chooser-panel" id="col-chooser-panel"></div>
-                    </div>
                 </div>
             </div>
             <div class="search-row">
@@ -1522,166 +1286,26 @@ fn build_search_html(
             </div>
             <input type="hidden" name="limit" value="{}">
             <input type="hidden" name="offset" value="0">
-            <input type="hidden" name="columns" id="columns-input" value="{}">
+            <input type="hidden" name="columns" value="{}">
         </form>
 
-        {}
-
-        {}
-
-        <div id="timechart-container">
-            <canvas id="timechart"></canvas>
-            <div id="bin-toggle">
-                <button type="button" class="bin-btn" data-bin="minute">Minutes</button>
-                <button type="button" class="bin-btn" data-bin="hour">Hours</button>
-            </div>
+        <div class="summary">
+            Showing {} loaded rows out of {} total
         </div>
 
-        <div id="results-table"></div>
-
-        {}
+        <div class="results-table-wrap">
+            <table class="results-table">
+                <thead>
+                    <tr>{}</tr>
+                </thead>
+                <tbody id="log-rows">
+                    {}
+                </tbody>
+            </table>
+        </div>
     </div>
 
-    <script type="application/json" id="results-data">
-        {}
-    </script>
-
-    <script type="application/json" id="histogram-data"
-            data-start="{}" data-end="{}" data-default-bin="{}">
-        {}
-    </script>
-
-    <script type="application/json" id="columns-data">{}</script>
-    <script type="application/json" id="active-columns-data">{}</script>
-
     <script>
-        // Initialize timechart
-        (function() {{
-            const histEl = document.getElementById('histogram-data');
-            const rangeStart = new Date(histEl.dataset.start);
-            const rangeEnd = new Date(histEl.dataset.end);
-            const defaultBin = histEl.dataset.defaultBin;
-            let allHist = {{}};
-            if (histEl && histEl.textContent.trim()) {{
-                try {{ allHist = JSON.parse(histEl.textContent); }} catch(e) {{}}
-            }}
-
-            const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-            function toKey(dt) {{
-                return dt.getUTCFullYear() + '-' +
-                    String(dt.getUTCMonth()+1).padStart(2,'0') + '-' +
-                    String(dt.getUTCDate()).padStart(2,'0') + ' ' +
-                    String(dt.getUTCHours()).padStart(2,'0') + ':' +
-                    String(dt.getUTCMinutes()).padStart(2,'0') + ':' +
-                    String(dt.getUTCSeconds()).padStart(2,'0');
-            }}
-
-            function truncate(dt, unit) {{
-                const d = new Date(dt);
-                if (unit === 'minute') {{
-                    d.setUTCSeconds(0, 0);
-                }} else {{
-                    d.setUTCMinutes(0, 0, 0);
-                }}
-                return d;
-            }}
-
-            function formatLabel(dt, unit) {{
-                if (unit === 'minute') {{
-                    return String(dt.getUTCHours()).padStart(2,'0') + ':' +
-                           String(dt.getUTCMinutes()).padStart(2,'0');
-                }} else {{
-                    return months[dt.getUTCMonth()] + ' ' + dt.getUTCDate() + ' ' +
-                           String(dt.getUTCHours()).padStart(2,'0') + ':00';
-                }}
-            }}
-
-            function buildSeries(unit) {{
-                const histData = allHist[unit] || [];
-                const countMap = {{}};
-                histData.forEach(d => {{ countMap[d.bin] = d.count; }});
-                const binMs = unit === 'minute' ? 60000 : 3600000;
-                const labels = [];
-                const counts = [];
-                let cur = truncate(rangeStart, unit);
-                const endT = rangeEnd.getTime();
-                while (cur.getTime() <= endT) {{
-                    labels.push(formatLabel(cur, unit));
-                    counts.push(countMap[toKey(cur)] || 0);
-                    cur = new Date(cur.getTime() + binMs);
-                }}
-                return {{ labels, counts }};
-            }}
-
-            const container = document.getElementById('timechart-container');
-            let chart = null;
-
-            function renderChart(unit) {{
-                const series = buildSeries(unit);
-                if (series.labels.length === 0) {{
-                    container.style.display = 'none';
-                    return;
-                }}
-                container.style.display = '';
-
-                // Update active button
-                document.querySelectorAll('.bin-btn').forEach(b => {{
-                    b.classList.toggle('active', b.dataset.bin === unit);
-                }});
-
-                if (chart) {{
-                    chart.data.labels = series.labels;
-                    chart.data.datasets[0].data = series.counts;
-                    chart.update();
-                }} else {{
-                    chart = new Chart(document.getElementById('timechart'), {{
-                        type: 'bar',
-                        data: {{
-                            labels: series.labels,
-                            datasets: [{{
-                                label: 'Events',
-                                data: series.counts,
-                                backgroundColor: 'rgba(0, 217, 255, 0.7)',
-                                borderColor: 'rgba(0, 217, 255, 1)',
-                                borderWidth: 1,
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {{
-                                legend: {{ display: false }},
-                            }},
-                            scales: {{
-                                x: {{
-                                    ticks: {{ color: '#888', maxRotation: 45, maxTicksLimit: 30 }},
-                                    grid: {{ color: 'rgba(255,255,255,0.05)' }},
-                                }},
-                                y: {{
-                                    beginAtZero: true,
-                                    ticks: {{ color: '#888' }},
-                                    grid: {{ color: 'rgba(255,255,255,0.05)' }},
-                                }}
-                            }}
-                        }}
-                    }});
-                }}
-            }}
-
-            // Bind toggle buttons
-            document.querySelectorAll('.bin-btn').forEach(btn => {{
-                btn.addEventListener('click', () => renderChart(btn.dataset.bin));
-            }});
-
-            // Initial render
-            renderChart(defaultBin);
-        }})();
-    </script>
-
-    <script type="module">
-        import {{TabulatorFull as Tabulator}} from "https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator_esm.min.js";
-
         // Focus search on / key
         document.addEventListener('keydown', function(e) {{
             if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
@@ -1697,134 +1321,6 @@ fn build_search_html(
             document.querySelector('form').submit();
         }}
         window.setTimeRange = setTimeRange;
-
-        // Initialize Tabulator
-        const dataElement = document.getElementById('results-data');
-        let data = [];
-        if (dataElement && dataElement.textContent.trim()) {{
-            try {{
-                data = JSON.parse(dataElement.textContent);
-            }} catch (parseError) {{
-                console.error('Failed to parse JSON:', parseError);
-            }}
-        }}
-
-        // Build dynamic column definitions
-        const activeColumns = JSON.parse(document.getElementById('active-columns-data').textContent || '[]');
-        const knownWidths = {{timestamp: 200, hostname: 120, unit: 150, priority: 70, comm: 120, pid: 80}};
-        const knownAlign = {{priority: "center"}};
-
-        function buildColumns(cols) {{
-            return cols.map(field => {{
-                const def = {{title: field.charAt(0).toUpperCase() + field.slice(1), field: field}};
-                if (knownWidths[field]) def.width = knownWidths[field];
-                if (knownAlign[field]) def.hozAlign = knownAlign[field];
-                return def;
-            }});
-        }}
-
-        if (data.length > 0) {{
-            new Tabulator("#results-table", {{
-                data: data,
-                layout: "fitColumns",
-                height: "600px",
-                columns: buildColumns(activeColumns),
-                rowFormatter: function(row) {{
-                    const p = row.getData().priority;
-                    if (p !== undefined && p !== null) {{
-                        if (p <= 2) {{
-                            row.getElement().style.backgroundColor = "rgba(255, 0, 0, 0.15)";
-                        }} else if (p <= 3) {{
-                            row.getElement().style.backgroundColor = "rgba(255, 100, 0, 0.1)";
-                        }} else if (p <= 4) {{
-                            row.getElement().style.backgroundColor = "rgba(255, 200, 0, 0.05)";
-                        }}
-                    }}
-                }},
-            }});
-        }}
-
-        // Column chooser logic
-        (function() {{
-            const allCols = JSON.parse(document.getElementById('columns-data').textContent || '[]');
-            const panel = document.getElementById('col-chooser-panel');
-            const toggle = document.getElementById('col-chooser-toggle');
-            const columnsInput = document.getElementById('columns-input');
-            const form = document.querySelector('form');
-
-            // Load saved preferences from localStorage
-            let savedCols = null;
-            try {{
-                const stored = localStorage.getItem('livedata-columns');
-                if (stored) savedCols = JSON.parse(stored);
-            }} catch(e) {{}}
-
-            // Determine which columns are currently active
-            const currentActive = new Set(
-                columnsInput.value ? columnsInput.value.split(',') : allCols.filter(c => c.default).map(c => c.name)
-            );
-
-            // Build checkboxes
-            allCols.forEach(col => {{
-                const label = document.createElement('label');
-                const cb = document.createElement('input');
-                cb.type = 'checkbox';
-                cb.value = col.name;
-                cb.checked = currentActive.has(col.name);
-                const nameSpan = document.createElement('span');
-                nameSpan.textContent = col.name;
-                const typeSpan = document.createElement('span');
-                typeSpan.className = 'col-type';
-                typeSpan.textContent = col.column_type;
-                label.appendChild(cb);
-                label.appendChild(nameSpan);
-                label.appendChild(typeSpan);
-                panel.appendChild(label);
-            }});
-
-            // Add Apply / Reset buttons
-            const actions = document.createElement('div');
-            actions.className = 'col-actions';
-            const applyBtn = document.createElement('button');
-            applyBtn.type = 'button';
-            applyBtn.textContent = 'Apply';
-            applyBtn.addEventListener('click', () => {{
-                const checked = Array.from(panel.querySelectorAll('input[type=checkbox]:checked')).map(cb => cb.value);
-                if (checked.length === 0) return;
-                localStorage.setItem('livedata-columns', JSON.stringify(checked));
-                columnsInput.value = checked.join(',');
-                form.submit();
-            }});
-            const resetBtn = document.createElement('button');
-            resetBtn.type = 'button';
-            resetBtn.textContent = 'Reset';
-            resetBtn.style.backgroundColor = '#0f3460';
-            resetBtn.style.color = '#ccc';
-            resetBtn.addEventListener('click', () => {{
-                localStorage.removeItem('livedata-columns');
-                columnsInput.value = '';
-                form.submit();
-            }});
-            actions.appendChild(applyBtn);
-            actions.appendChild(resetBtn);
-            panel.appendChild(actions);
-
-            // Toggle panel
-            toggle.addEventListener('click', (e) => {{
-                e.stopPropagation();
-                panel.classList.toggle('open');
-            }});
-            document.addEventListener('click', (e) => {{
-                if (!panel.contains(e.target) && e.target !== toggle) {{
-                    panel.classList.remove('open');
-                }}
-            }});
-
-            // On page load, if localStorage has saved columns, set the hidden input
-            if (savedCols && !columnsInput.value) {{
-                columnsInput.value = savedCols.join(',');
-            }}
-        }})();
 
         // Storage health indicator
         (async function() {{
@@ -1877,22 +1373,316 @@ fn build_search_html(
         priority_options,                        // {5} priority options
         params.limit.min(100_000),               // {6} limit
         params.columns.as_deref().unwrap_or(""), // {7} columns hidden input
-        pagination.clone(),                      // {8} top pagination
-        if results.is_empty() {
-            // {9} no-results message
-            "<div class=\"no-results\">No results found. Try adjusting your search or time range.</div>".to_string()
-        } else {
-            "".to_string()
-        },
-        pagination,          // {10} bottom pagination
-        results_json,        // {11} results JSON
-        start_iso,           // {12} histogram start
-        end_iso,             // {13} histogram end
-        bin_unit,            // {14} default bin
-        histogram_json,      // {15} histogram data
-        columns_json,        // {16} all columns info
-        active_columns_json, // {17} active column names
+        results.len(),                           // {8} loaded row count
+        total_count,                             // {9} total count
+        display_names
+            .iter()
+            .map(|name| format!("<th>{}</th>", html_escape(name)))
+            .collect::<Vec<_>>()
+            .join(""), // {10} table headers
+        chunk_fragment,                          // {11} rows fragment
     )
+}
+
+fn render_log_chunk_fragment(
+    params: &SearchParams,
+    results: &[serde_json::Value],
+    display_names: &[String],
+    total_count: usize,
+) -> String {
+    let rows = render_log_rows(results, display_names);
+    let loaded_end = params.offset + results.len();
+    let col_span = display_names.len().max(1);
+    let load_more_row = if loaded_end < total_count {
+        let next_offset = loaded_end;
+        let next_url = build_log_chunk_url(params, next_offset);
+        format!(
+            r##"<tr id="load-more-logs"><td class="load-row" colspan="{}"><button hx-get="{}" hx-target="#load-more-logs" hx-swap="outerHTML">Load more</button></td></tr>"##,
+            col_span, next_url
+        )
+    } else if total_count == 0 {
+        format!(
+            r##"<tr id="load-more-logs"><td class="no-results" colspan="{}">No results found</td></tr>"##,
+            col_span
+        )
+    } else {
+        format!(
+            r##"<tr id="load-more-logs"><td class="load-row" colspan="{}">End of results</td></tr>"##,
+            col_span
+        )
+    };
+
+    format!("{}{}", rows, load_more_row)
+}
+
+fn render_log_rows(results: &[serde_json::Value], display_names: &[String]) -> String {
+    let mut out = String::new();
+
+    for row in results {
+        let Some(obj) = row.as_object() else {
+            continue;
+        };
+
+        let priority_value = obj.get("priority").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        });
+        let row_class = match priority_value {
+            Some(p) if p <= 2 => "priority-critical",
+            Some(3) => "priority-error",
+            Some(4) => "priority-warning",
+            _ => "",
+        };
+
+        out.push_str(&format!("<tr class=\"{}\">", row_class));
+        for col in display_names {
+            let value = obj.get(col).unwrap_or(&serde_json::Value::Null);
+            let text = match value {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => value.to_string(),
+            };
+            out.push_str(&format!("<td>{}</td>", html_escape(&text)));
+        }
+        out.push_str("</tr>");
+    }
+
+    out
+}
+
+fn build_log_chunk_url(params: &SearchParams, offset: usize) -> String {
+    format!(
+        "/htmx/logs/chunk?q={}&start={}&end={}&hostname={}&unit={}&limit={}&offset={}&sort={}&sort_dir={}{}{}",
+        url_encode(params.q.as_deref().unwrap_or("")),
+        url_encode(&params.start),
+        url_encode(&params.end),
+        url_encode(params.hostname.as_deref().unwrap_or("")),
+        url_encode(params.unit.as_deref().unwrap_or("")),
+        params.limit.min(100_000),
+        offset,
+        url_encode(&params.sort),
+        url_encode(&params.sort_dir),
+        params
+            .priority
+            .map(|p| format!("&priority={}", p))
+            .unwrap_or_default(),
+        params
+            .columns
+            .as_deref()
+            .map(|c| format!("&columns={}", url_encode(c)))
+            .unwrap_or_default()
+    )
+}
+
+fn build_processes_html() -> String {
+    r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>livedata - Process Monitor</title>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1400px; margin: 0 auto; padding: 0; background-color: #f5f5f5; }
+        .global-header { background: white; border-bottom: 2px solid #007bff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .global-header nav { display: flex; gap: 5px; padding: 15px 20px; max-width: 1400px; margin: 0 auto; }
+        .global-header nav a { color: #007bff; text-decoration: none; font-size: 16px; font-weight: 500; padding: 10px 18px; border-radius: 4px; }
+        .global-header nav a.active { background-color: #007bff; color: white; }
+        .container { padding: 0 20px 20px; }
+        .controls { display: flex; gap: 12px; align-items: end; margin-bottom: 14px; flex-wrap: wrap; }
+        input, button { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+        button { background-color: #007bff; color: white; border: none; cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 10px; border-bottom: 1px solid #eee; text-align: left; }
+        th { background: #fafafa; }
+        .muted { color: #666; }
+        .load-row { text-align: center; padding: 12px; }
+        .load-row button { background: white; color: #007bff; border: 1px solid #007bff; }
+        #storage-health { margin-bottom: 20px; padding: 15px 20px; background: white; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; color: #555; }
+        #storage-health .health-item { display: inline-block; margin-right: 25px; }
+        #storage-health .health-label { font-weight: 600; margin-right: 5px; }
+        #storage-health .status-good { color: #28a745; }
+        #storage-health .status-warning { color: #ffc107; }
+        #storage-health .status-critical { color: #dc3545; }
+    </style>
+</head>
+<body>
+    <div class="global-header">
+        <nav>
+            <a href="/" target="_blank">Log Search</a>
+            <a href="/processes.html" target="_blank" class="active">Processes</a>
+        </nav>
+    </div>
+    <div class="container">
+        <div id="storage-health">
+            <span class="health-item"><span class="health-label">Storage:</span><span id="storage-info">Loading...</span></span>
+            <span class="health-item"><span class="health-label">Retention:</span><span id="retention-info">Loading...</span></span>
+        </div>
+
+        <h1>Process Monitor</h1>
+
+        <form class="controls" hx-get="/htmx/processes/chunk" hx-target="#processes-body" hx-swap="innerHTML">
+            <div>
+                <label for="q">Search</label><br>
+                <input id="q" name="q" type="text" placeholder="Fuzzy search processes..." />
+            </div>
+            <div>
+                <label for="limit">Rows</label><br>
+                <input id="limit" name="limit" type="number" min="10" max="1000" value="100" />
+            </div>
+            <div>
+                <input name="offset" type="hidden" value="0" />
+                <button type="submit">Refresh</button>
+            </div>
+            <div class="muted" id="last-updated">Never</div>
+        </form>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Timestamp</th>
+                    <th>PID</th>
+                    <th>Name</th>
+                    <th>CPU %</th>
+                    <th>Memory</th>
+                    <th>User</th>
+                    <th>Runtime</th>
+                </tr>
+            </thead>
+            <tbody id="processes-body" hx-get="/htmx/processes/chunk?offset=0&limit=100" hx-trigger="load" hx-swap="innerHTML"></tbody>
+        </table>
+    </div>
+
+    <script>
+        (async function() {
+            async function updateStorageHealth() {
+                try {
+                    const response = await fetch('/api/storage/health');
+                    if (!response.ok) throw new Error('Failed to fetch storage health');
+                    const data = await response.json();
+                    const sizeGB = (data.database_size_bytes / (1024 * 1024 * 1024)).toFixed(2);
+                    const maxSizeGB = Math.max(data.retention_policy.log_max_size_gb, data.retention_policy.process_max_size_gb);
+                    const usagePercent = (parseFloat(sizeGB) / maxSizeGB) * 100;
+                    let statusClass = 'status-good';
+                    if (usagePercent >= 90) statusClass = 'status-critical';
+                    else if (usagePercent >= 75) statusClass = 'status-warning';
+                    document.getElementById('storage-info').innerHTML =
+                        `<span class="${statusClass}">${sizeGB}GB / ${maxSizeGB}GB</span> (${data.journal_log_count.toLocaleString()} logs, ${data.process_metric_count.toLocaleString()} metrics)`;
+                    document.getElementById('retention-info').textContent =
+                        `${data.retention_policy.log_retention_days}d logs / ${data.retention_policy.process_retention_days}d proc`;
+                } catch (error) {
+                    document.getElementById('storage-info').innerHTML = '<span class="status-critical">Error loading</span>';
+                    document.getElementById('retention-info').textContent = 'N/A';
+                }
+            }
+            await updateStorageHealth();
+            setInterval(updateStorageHealth, 30000);
+        })();
+    </script>
+</body>
+</html>"##
+        .to_string()
+}
+
+fn render_process_chunk_fragment(
+    params: &ProcessTableParams,
+    rows: &[ProcessMetricsRow],
+    total_count: usize,
+    timestamp: &str,
+) -> String {
+    let mut html = String::new();
+    for p in rows {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            html_escape(timestamp),
+            p.pid,
+            html_escape(&p.name),
+            p.cpu_usage,
+            html_escape(&format_bytes(p.mem_usage)),
+            html_escape(p.user.as_deref().unwrap_or("-")),
+            html_escape(&format_runtime(p.runtime))
+        ));
+    }
+
+    let loaded_end = params.offset + rows.len();
+    if loaded_end < total_count {
+        let next_offset = loaded_end;
+        let next_url = format!(
+            "/htmx/processes/chunk?q={}&limit={}&offset={}",
+            url_encode(params.q.as_deref().unwrap_or("")),
+            params.limit.clamp(10, 1000),
+            next_offset
+        );
+        html.push_str(&format!(
+            r##"<tr id="load-more-processes"><td class="load-row" colspan="7"><button hx-get="{}" hx-target="#load-more-processes" hx-swap="outerHTML">Load more</button></td></tr>"##,
+            next_url
+        ));
+    } else if total_count == 0 {
+        html.push_str(
+            r##"<tr id="load-more-processes"><td class="load-row muted" colspan="7">No processes found</td></tr>"##,
+        );
+    } else {
+        html.push_str(
+            r##"<tr id="load-more-processes"><td class="load-row muted" colspan="7">End of results</td></tr>"##,
+        );
+    }
+
+    html
+}
+
+fn fuzzy_match(query: &str, text: &str) -> bool {
+    let mut text_chars = text.chars();
+    for qc in query.chars() {
+        if !text_chars.any(|tc| tc == qc) {
+            return false;
+        }
+    }
+    true
+}
+
+fn format_bytes(bytes: f64) -> String {
+    if bytes <= 0.0 {
+        return "-".to_string();
+    }
+    let units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes;
+    let mut idx = 0usize;
+    while value >= 1024.0 && idx < units.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    format!("{:.1} {}", value, units[idx])
+}
+
+fn format_runtime(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{}s", seconds);
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        let rem = seconds % 60;
+        return if rem > 0 {
+            format!("{}m {}s", minutes, rem)
+        } else {
+            format!("{}m", minutes)
+        };
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        let rem = minutes % 60;
+        return if rem > 0 {
+            format!("{}h {}m", hours, rem)
+        } else {
+            format!("{}h", hours)
+        };
+    }
+    let days = hours / 24;
+    let rem = hours % 24;
+    if rem > 0 {
+        format!("{}d {}h", days, rem)
+    } else {
+        format!("{}d", days)
+    }
 }
 
 /// HTML escape helper
@@ -1932,10 +1722,12 @@ fn create_test_app(data_dir: &str) -> Router {
     let state = Arc::new(AppState::new(data_dir, buffer, process_monitor, settings));
     Router::new()
         .route("/", get(search_ui))
+        .route("/htmx/logs/chunk", get(htmx_logs_chunk))
         .route("/api/search", get(api_search))
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/api/processes", get(api_processes))
+        .route("/htmx/processes/chunk", get(htmx_processes_chunk))
         .route("/api/storage/health", get(api_storage_health))
         .route("/health", get(health))
         .with_state(state)
