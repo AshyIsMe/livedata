@@ -44,6 +44,10 @@ struct Args {
     #[arg(long)]
     cleanup_interval: Option<u32>,
 
+    /// Write plaintext SQL trace to data_dir/trace.sql
+    #[arg(long)]
+    sql_trace: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -96,6 +100,21 @@ fn main() -> Result<()> {
     if args.follow {
         info!("Follow mode enabled: skipping historical data processing");
     }
+    if args.sql_trace {
+        if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
+            eprintln!("Failed to create data directory {}: {}", args.data_dir, e);
+        }
+        let trace_path = std::path::Path::new(&args.data_dir).join("trace.sql");
+        if let Err(e) = livedata::sql_trace::init_sql_trace(&trace_path) {
+            eprintln!(
+                "Failed to initialize SQL trace at {}: {}",
+                trace_path.display(),
+                e
+            );
+        } else {
+            info!("SQL trace enabled at: {}", trace_path.display());
+        }
+    }
 
     // Check if the web subcommand is present
     if let Some(Commands::Web) = args.command {
@@ -108,6 +127,7 @@ fn main() -> Result<()> {
 
         // Get process monitor from app BEFORE moving app
         let process_monitor = app.get_process_monitor();
+        let buffer = app.get_buffer();
 
         // Run the web server in a separate thread
         let data_dir = args.data_dir.clone();
@@ -115,20 +135,24 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(run_web_server(
                 &data_dir,
+                buffer,
                 shutdown_signal,
                 process_monitor,
                 settings_for_web,
             ));
         });
 
-        app.run(args.follow)?;
+        app.run(args.follow, false)?;
 
         // Wait for the web server to finish
         web_server_handle.join().unwrap();
+
+        // Ensure checkpoint after the web server releases its connection.
+        app.checkpoint_database();
     } else {
         // Create and run the application in the main thread
         let mut app = ApplicationController::new(&args.data_dir, args.process_interval, settings)?;
-        app.run(args.follow)?;
+        app.run(args.follow, true)?;
     }
 
     info!("Application shutdown complete");

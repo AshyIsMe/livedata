@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 systemd = "0.10"           # journald interface
-duckdb = { version = "1.4.3", features = ["bundled", "serde_json", "r2d2", "parquet"] }  # in-memory database for buffering
+duckdb = { version = "1.4.4", features = ["bundled", "serde_json", "r2d2", "parquet"] }  # in-memory database for buffering
 chrono = { version = "0.4", features = ["serde"] }
 gethostname = "0.4"        # system hostname
 serde = { version = "1.0", features = ["derive"] }

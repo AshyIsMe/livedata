@@ -8,9 +8,8 @@ use chrono::{TimeDelta, Utc};
 use gethostname::gethostname;
 use log::{error, info, warn};
 use signal_hook::consts::SIGINT;
-use signal_hook::iterator::Signals;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -18,13 +17,12 @@ use tokio::sync::mpsc;
 
 pub struct ApplicationController {
     journal_reader: JournalLogReader,
-    buffer: DuckDBBuffer,
+    buffer: Arc<Mutex<DuckDBBuffer>>,
     hostname: String,
     shutdown_signal: Arc<AtomicBool>,
     process_monitor: Arc<ProcessMonitor>,
     process_monitor_handle: Option<thread::JoinHandle<()>>,
     metrics_receiver_handle: Option<thread::JoinHandle<()>>,
-    cleanup_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ApplicationController {
@@ -40,8 +38,21 @@ impl ApplicationController {
         // Backup database before any migrations
         Self::backup_database(&data_dir)?;
 
+        let mut buffer = DuckDBBuffer::new(&data_dir)?;
+        let cleanup_stats = buffer.enforce_retention(
+            settings.log_retention_days,
+            settings.log_max_size_gb,
+            settings.process_retention_days,
+            settings.process_max_size_gb,
+        )?;
+        if cleanup_stats.total_deleted() > 0 {
+            info!(
+                "Startup cleanup complete: {} total records deleted",
+                cleanup_stats.total_deleted()
+            );
+        }
+        let buffer = Arc::new(Mutex::new(buffer));
         let journal_reader = JournalLogReader::new()?;
-        let buffer = DuckDBBuffer::new(&data_dir)?;
         let hostname = gethostname().to_str().unwrap_or("unknown").to_string();
 
         // Create mpsc channel for process metrics
@@ -58,8 +69,7 @@ impl ApplicationController {
             process_interval
         );
 
-        // Get database path for the receiver task
-        let db_path = buffer.db_path().to_path_buf();
+        let shared_buffer = buffer.clone();
 
         // Spawn dedicated receiver task in a thread to persist process metrics
         let metrics_receiver_handle = thread::spawn(move || {
@@ -67,55 +77,23 @@ impl ApplicationController {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
-                // Open a separate connection for process metrics
-                let conn = match duckdb::Connection::open(&db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to open database connection for process metrics: {}", e);
-                        return;
-                    }
-                };
-
                 info!("Process metrics receiver task started");
 
                 while let Some(batch) = metrics_rx.recv().await {
                     let process_count = batch.processes.len();
-                    info!("Received process metrics batch with {} processes", process_count);
+                    info!(
+                        "Received process metrics batch with {} processes",
+                        process_count
+                    );
 
                     if batch.processes.is_empty() {
                         continue;
                     }
 
-                    // Batch insert all process metrics in a transaction
-                    let result = conn.execute("BEGIN TRANSACTION", [])
-                        .and_then(|_| {
-                            let mut stmt = conn.prepare(
-                                "INSERT INTO process_metrics (timestamp, pid, name, cpu_usage, mem_usage, user, runtime)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?)"
-                            )?;
-
-                            for process in batch.processes {
-                                // Extract numeric UID from "Uid(1234)" format
-                                let user = process.user_id.as_ref().and_then(|uid_str| {
-                                    uid_str.strip_prefix("Uid(")
-                                        .and_then(|s| s.strip_suffix(')'))
-                                        .map(|s| s.to_string())
-                                });
-
-                                stmt.execute(duckdb::params![
-                                    batch.timestamp.to_rfc3339(),
-                                    process.pid as i32,
-                                    process.name,
-                                    process.cpu_percent as f64,
-                                    process.memory_bytes as f64,
-                                    user,
-                                    process.runtime_secs as i64,
-                                ])?;
-                            }
-
-                            conn.execute("COMMIT", [])?;
-                            conn.execute("CHECKPOINT", [])
-                        });
+                    let result = shared_buffer
+                        .lock()
+                        .unwrap()
+                        .add_process_metrics(batch.processes, batch.timestamp);
 
                     if let Err(e) = result {
                         error!("Failed to persist process metrics: {}", e);
@@ -124,7 +102,7 @@ impl ApplicationController {
                     }
                 }
 
-                if let Err(e) = conn.execute("CHECKPOINT", []) {
+                if let Err(e) = shared_buffer.lock().unwrap().checkpoint() {
                     error!("Failed to checkpoint process metrics connection: {}", e);
                 }
 
@@ -133,13 +111,9 @@ impl ApplicationController {
         });
 
         info!("Application Controller initialized successfully");
-        info!("Using on-disk DuckDB at: {}", buffer.db_path().display());
-
-        // Spawn background cleanup task
-        let cleanup_handle = Self::spawn_cleanup_task(
-            buffer.db_path().to_path_buf(),
-            settings.clone(),
-            shutdown_signal.clone(),
+        info!(
+            "Using on-disk DuckDB at: {}",
+            buffer.lock().unwrap().db_path().display()
         );
 
         Ok(Self {
@@ -150,7 +124,6 @@ impl ApplicationController {
             process_monitor,
             process_monitor_handle: Some(process_monitor_handle),
             metrics_receiver_handle: Some(metrics_receiver_handle),
-            cleanup_handle: Some(cleanup_handle),
         })
     }
 
@@ -172,77 +145,6 @@ impl ApplicationController {
         Ok(())
     }
 
-    /// Spawn background cleanup task that runs periodically
-    fn spawn_cleanup_task(
-        db_path: PathBuf,
-        settings: Settings,
-        shutdown_signal: Arc<AtomicBool>,
-    ) -> thread::JoinHandle<()> {
-        let interval_secs = settings.cleanup_interval_minutes * 60;
-
-        info!(
-            "Starting periodic storage cleanup (interval: {}m, priority: high)",
-            settings.cleanup_interval_minutes
-        );
-
-        thread::spawn(move || {
-            // Create tokio runtime for this thread
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-
-            rt.block_on(async move {
-                let interval = Duration::from_secs(interval_secs as u64);
-
-                // Run first cleanup immediately.
-                if !shutdown_signal.load(Ordering::Relaxed) {
-                    if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
-                        error!("Cleanup cycle failed: {}", e);
-                    }
-                }
-
-                let mut next_run = tokio::time::Instant::now() + interval;
-
-                loop {
-                    if shutdown_signal.load(Ordering::Relaxed) {
-                        info!("Cleanup task shutting down");
-                        break;
-                    }
-
-                    let now = tokio::time::Instant::now();
-                    if now >= next_run {
-                        if let Err(e) = Self::run_cleanup_cycle(&db_path, &settings) {
-                            error!("Cleanup cycle failed: {}", e);
-                        }
-                        next_run = tokio::time::Instant::now() + interval;
-                    }
-
-                    // Short sleep so shutdown can interrupt promptly.
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            });
-        })
-    }
-
-    /// Run a single cleanup cycle (uninterruptible)
-    fn run_cleanup_cycle(db_path: &Path, settings: &Settings) -> Result<()> {
-        let mut buffer = DuckDBBuffer::new(db_path.parent().unwrap())?;
-
-        let stats = buffer.enforce_retention(
-            settings.log_retention_days,
-            settings.log_max_size_gb,
-            settings.process_retention_days,
-            settings.process_max_size_gb,
-        )?;
-
-        if stats.total_deleted() > 0 {
-            info!(
-                "Cleanup cycle complete: {} total records deleted",
-                stats.total_deleted()
-            );
-        }
-
-        Ok(())
-    }
-
     pub fn get_shutdown_signal(&self) -> Arc<AtomicBool> {
         self.shutdown_signal.clone()
     }
@@ -251,28 +153,18 @@ impl ApplicationController {
         self.process_monitor.clone()
     }
 
+    pub fn get_buffer(&self) -> Arc<Mutex<DuckDBBuffer>> {
+        self.buffer.clone()
+    }
+
     pub fn setup_signal_handler(&self) -> Result<()> {
-        let shutdown_signal = self.shutdown_signal.clone();
-        thread::spawn(move || {
-            let mut signals = Signals::new([SIGINT, signal_hook::consts::SIGTERM]).unwrap();
-            for signal in &mut signals {
-                match signal {
-                    SIGINT | signal_hook::consts::SIGTERM => {
-                        if shutdown_signal.swap(true, Ordering::Relaxed) {
-                            info!("Received shutdown signal {}, shutdown already in progress", signal);
-                        } else {
-                            info!("Received shutdown signal: {}", signal);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
+        signal_hook::flag::register(SIGINT, self.shutdown_signal.clone())?;
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, self.shutdown_signal.clone())?;
 
         Ok(())
     }
 
-    pub fn run(&mut self, follow: bool) -> Result<()> {
+    pub fn run(&mut self, follow: bool, checkpoint_on_shutdown: bool) -> Result<()> {
         info!("Starting journald log collection to DuckDB");
 
         self.setup_signal_handler()?;
@@ -300,16 +192,10 @@ impl ApplicationController {
                 break;
             }
 
-            // Wait for new journal entries with a short timeout
-            if self
-                .journal_reader
-                .wait_for_entry(Some(Duration::from_millis(100)))?
-            {
-                // Process any new journal entries
-                while let Ok(Some(entry)) = self.journal_reader.next_log_entry() {
-                    if let Err(e) = self.process_log_entry(entry) {
-                        error!("Failed to process log entry: {}", e);
-                    }
+            // Drain any newly available journal entries.
+            while let Ok(Some(entry)) = self.journal_reader.next_log_entry() {
+                if let Err(e) = self.process_log_entry(entry) {
+                    error!("Failed to process log entry: {}", e);
                 }
             }
 
@@ -325,7 +211,7 @@ impl ApplicationController {
         }
 
         // Graceful shutdown
-        self.graceful_shutdown()
+        self.graceful_shutdown(checkpoint_on_shutdown)
     }
 
     fn process_startup_historical_data(&mut self) -> Result<()> {
@@ -336,13 +222,14 @@ impl ApplicationController {
 
         // Process historical entries from the last hour in a single transaction
         // to avoid per-row auto-commit overhead
-        self.buffer.conn.execute("BEGIN TRANSACTION", [])?;
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.begin_transaction()?;
         let result = self
             .journal_reader
-            .process_historical_entries(cutoff_time, |entry| self.buffer.add_entry(entry));
+            .process_historical_entries(cutoff_time, |entry| buffer.add_entry(entry));
         match result {
             Ok(count) => {
-                self.buffer.conn.execute("COMMIT", [])?;
+                buffer.commit_transaction()?;
                 let processed_count = count;
 
                 info!(
@@ -351,7 +238,7 @@ impl ApplicationController {
                 );
             }
             Err(e) => {
-                let _ = self.buffer.conn.execute("ROLLBACK", []);
+                let _ = buffer.rollback_transaction();
                 return Err(e);
             }
         }
@@ -368,11 +255,11 @@ impl ApplicationController {
 
     fn process_log_entry(&mut self, entry: LogEntry) -> Result<()> {
         // Add entry to on-disk DuckDB
-        self.buffer.add_entry(&entry)?;
+        self.buffer.lock().unwrap().add_entry(&entry)?;
         Ok(())
     }
 
-    fn graceful_shutdown(&mut self) -> Result<()> {
+    fn graceful_shutdown(&mut self, checkpoint_on_shutdown: bool) -> Result<()> {
         info!("Starting graceful shutdown");
 
         self.shutdown_signal.store(true, Ordering::Relaxed);
@@ -391,14 +278,10 @@ impl ApplicationController {
             }
         }
 
-        if let Some(handle) = self.cleanup_handle.take() {
-            if let Err(e) = handle.join() {
-                warn!("Failed to join cleanup thread: {:?}", e);
-            }
-        }
-
-        if let Err(e) = self.buffer.conn.execute("CHECKPOINT", []) {
-            warn!("Failed to checkpoint database during shutdown: {}", e);
+        if checkpoint_on_shutdown {
+            self.checkpoint_database();
+        } else {
+            info!("Skipping shutdown checkpoint (deferred)");
         }
 
         // Log final statistics
@@ -408,8 +291,15 @@ impl ApplicationController {
         Ok(())
     }
 
+    pub fn checkpoint_database(&mut self) {
+        if let Err(e) = self.buffer.lock().unwrap().checkpoint() {
+            warn!("Failed to checkpoint database during shutdown: {}", e);
+        }
+    }
+
     fn log_status(&mut self) {
-        match self.buffer.get_buffer_stats() {
+        let mut buffer = self.buffer.lock().unwrap();
+        match buffer.get_buffer_stats() {
             Ok(stats) => {
                 info!(
                     "Status: {} total entries in DuckDB, {} distinct minutes",
@@ -426,7 +316,7 @@ impl ApplicationController {
         }
 
         // Log database file size
-        if let Ok(metadata) = std::fs::metadata(self.buffer.db_path()) {
+        if let Ok(metadata) = std::fs::metadata(buffer.db_path()) {
             let size_mb = metadata.len() / (1024 * 1024);
             info!("Database size: {} MB", size_mb);
         }
@@ -436,7 +326,8 @@ impl ApplicationController {
         info!("=== Final Statistics ===");
 
         // Database statistics
-        match self.buffer.get_buffer_stats() {
+        let mut buffer = self.buffer.lock().unwrap();
+        match buffer.get_buffer_stats() {
             Ok(stats) => {
                 info!(
                     "Total entries in DuckDB: {}, distinct minutes: {}",
@@ -449,18 +340,19 @@ impl ApplicationController {
         }
 
         // Database file size
-        if let Ok(metadata) = std::fs::metadata(self.buffer.db_path()) {
+        if let Ok(metadata) = std::fs::metadata(buffer.db_path()) {
             let size_mb = metadata.len() / (1024 * 1024);
             info!("Final database size: {} MB", size_mb);
         }
 
-        info!("Database path: {}", self.buffer.db_path().display());
+        info!("Database path: {}", buffer.db_path().display());
         info!("=== End Statistics ===");
     }
 
     pub fn get_status(&mut self) -> Result<ApplicationStatus> {
-        let buffer_stats = self.buffer.get_buffer_stats()?;
-        let db_size = std::fs::metadata(self.buffer.db_path())
+        let mut buffer = self.buffer.lock().unwrap();
+        let buffer_stats = buffer.get_buffer_stats()?;
+        let db_size = std::fs::metadata(buffer.db_path())
             .map(|m| m.len())
             .unwrap_or(0);
 
@@ -488,6 +380,7 @@ pub struct ApplicationStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_trace::trace_sql;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -518,13 +411,14 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(100));
 
-        controller.graceful_shutdown().unwrap();
+        controller.graceful_shutdown(true).unwrap();
 
         let db_path = temp_dir.path().join("livedata.duckdb");
         let conn = duckdb::Connection::open(&db_path);
         assert!(conn.is_ok());
 
         let conn = conn.unwrap();
+        trace_sql("SELECT COUNT(*) FROM _schema_version");
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _schema_version", [], |row| row.get(0))
             .unwrap();

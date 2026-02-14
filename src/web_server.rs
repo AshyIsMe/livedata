@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::duckdb_buffer::{DuckDBBuffer, ProcessMetricRecord};
 use crate::process_monitor::ProcessMonitor;
 use axum::{
     Json, Router,
@@ -8,7 +9,6 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Duration, Utc};
-use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 /// Application state shared across handlers
 pub struct AppState {
     pub data_dir: String,
-    pub conn: Mutex<Connection>,
+    pub buffer: Arc<Mutex<DuckDBBuffer>>,
     pub process_monitor: Arc<ProcessMonitor>,
     pub settings: Settings,
 }
@@ -25,18 +25,16 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         data_dir: &str,
+        buffer: Arc<Mutex<DuckDBBuffer>>,
         process_monitor: Arc<ProcessMonitor>,
         settings: Settings,
-    ) -> Result<Self, duckdb::Error> {
-        // Connect to the on-disk DuckDB database
-        let db_path = std::path::Path::new(data_dir).join("livedata.duckdb");
-        let conn = Connection::open(&db_path)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             data_dir: data_dir.to_string(),
-            conn: Mutex::new(conn),
+            buffer,
             process_monitor,
             settings,
-        })
+        }
     }
 }
 
@@ -184,6 +182,18 @@ pub struct ProcessMetricsRow {
     pub runtime: u64,
 }
 
+fn to_process_row(r: ProcessMetricRecord) -> ProcessMetricsRow {
+    ProcessMetricsRow {
+        timestamp: r.timestamp,
+        pid: r.pid,
+        name: r.name,
+        cpu_usage: r.cpu_usage,
+        mem_usage: r.mem_usage,
+        user: r.user,
+        runtime: r.runtime,
+    }
+}
+
 /// Storage health API response
 #[derive(Debug, Serialize)]
 pub struct StorageHealthResponse {
@@ -268,14 +278,12 @@ fn priority_label(p: u8) -> &'static str {
 
 pub async fn run_web_server(
     data_dir: &str,
+    buffer: Arc<Mutex<DuckDBBuffer>>,
     shutdown_signal: Arc<AtomicBool>,
     process_monitor: Arc<ProcessMonitor>,
     settings: Settings,
 ) {
-    let state = Arc::new(
-        AppState::new(data_dir, process_monitor, settings)
-            .expect("Failed to create application state"),
-    );
+    let state = Arc::new(AppState::new(data_dir, buffer, process_monitor, settings));
 
     let app = Router::new()
         .route("/", get(search_ui))
@@ -348,41 +356,23 @@ async fn serve_processes_js() -> impl IntoResponse {
 async fn api_processes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProcessResponse>, (StatusCode, String)> {
-    let latest_timestamp: Option<String> = {
-        let conn = state.conn.lock().unwrap();
-        conn.prepare("SELECT MAX(timestamp) FROM process_metrics")
-            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-            .ok()
-    };
+    let latest_timestamp = state
+        .buffer
+        .lock()
+        .unwrap()
+        .get_latest_process_timestamp()
+        .ok()
+        .flatten();
 
     if let Some(latest_timestamp) = latest_timestamp {
-        let conn = state.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime
-                 FROM process_metrics
-                 WHERE timestamp = ?",
-            )
+        let rows = state
+            .buffer
+            .lock()
+            .unwrap()
+            .get_process_metrics_for_timestamp(&latest_timestamp)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let rows = stmt
-            .query_map([latest_timestamp.clone()], |row| {
-                Ok(ProcessMetricsRow {
-                    timestamp: row.get(0)?,
-                    pid: row.get::<_, i64>(1)? as u32,
-                    name: row.get(2)?,
-                    cpu_usage: row.get::<_, f64>(3)? as f32,
-                    mem_usage: row.get(4)?,
-                    user: row.get(5)?,
-                    runtime: row.get::<_, i64>(6)? as u64,
-                })
-            })
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let mut processes = Vec::new();
-        for row in rows {
-            processes.push(row.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
-        }
+        let processes: Vec<ProcessMetricsRow> = rows.into_iter().map(to_process_row).collect();
 
         let total = processes.len();
         return Ok(Json(ProcessResponse {
@@ -428,35 +418,16 @@ async fn api_processes(
 async fn api_storage_health(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<StorageHealthResponse>, (StatusCode, String)> {
-    let conn = state.conn.lock().unwrap();
-
     // Get database file size
     let db_path = std::path::Path::new(&state.data_dir).join("livedata.duckdb");
     let database_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    // Get journal log count
-    let journal_log_count: i64 = conn
-        .prepare("SELECT COUNT(*) FROM journal_logs")
-        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-        .unwrap_or(0);
-
-    // Get process metric count
-    let process_metric_count: i64 = conn
-        .prepare("SELECT COUNT(*) FROM process_metrics")
-        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-        .unwrap_or(0);
-
-    // Get oldest log timestamp
-    let oldest_log_timestamp: Option<String> = conn
-        .prepare("SELECT MIN(timestamp) FROM journal_logs")
-        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-        .ok();
-
-    // Get newest log timestamp
-    let newest_log_timestamp: Option<String> = conn
-        .prepare("SELECT MAX(timestamp) FROM journal_logs")
-        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-        .ok();
+    let stats = state
+        .buffer
+        .lock()
+        .unwrap()
+        .get_storage_stats()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let retention_policy = RetentionPolicy {
         log_retention_days: state.settings.log_retention_days,
@@ -467,24 +438,17 @@ async fn api_storage_health(
 
     Ok(Json(StorageHealthResponse {
         database_size_bytes,
-        journal_log_count,
-        process_metric_count,
-        oldest_log_timestamp,
-        newest_log_timestamp,
+        journal_log_count: stats.journal_log_count,
+        process_metric_count: stats.process_metric_count,
+        oldest_log_timestamp: stats.oldest_log_timestamp,
+        newest_log_timestamp: stats.newest_log_timestamp,
         retention_policy,
     }))
 }
 
 /// Get valid column names from the journal_logs schema
-fn get_schema_columns(conn: &Connection) -> Vec<(String, String)> {
-    conn.prepare("DESCRIBE journal_logs")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default()
+fn get_schema_columns(buffer: &Arc<Mutex<DuckDBBuffer>>) -> Vec<(String, String)> {
+    buffer.lock().unwrap().get_schema_columns()
 }
 
 /// Validate requested columns against the actual schema, returning SQL expressions
@@ -521,8 +485,7 @@ fn column_display_name(col: &str) -> String {
 async fn api_columns(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ColumnInfo>>, (StatusCode, String)> {
-    let conn = state.conn.lock().unwrap();
-    let schema = get_schema_columns(&conn);
+    let schema = get_schema_columns(&state.buffer);
 
     let columns: Vec<ColumnInfo> = schema
         .iter()
@@ -552,10 +515,8 @@ async fn api_search(
     // Validate and clamp limit
     let limit = params.limit.min(100_000);
 
-    let conn = state.conn.lock().unwrap();
-
     // Determine which columns to select
-    let schema = get_schema_columns(&conn);
+    let schema = get_schema_columns(&state.buffer);
 
     // If the table doesn't exist yet, return empty results
     if schema.is_empty() {
@@ -657,51 +618,12 @@ async fn api_search(
     ));
 
     // Execute query with dynamic column mapping
-    let col_count = select_exprs.len();
-    let results: Vec<serde_json::Value> = match conn.prepare(&sql) {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| {
-                let mut map = serde_json::Map::new();
-                for (i, name) in display_names.iter().enumerate().take(col_count) {
-                    // Try string first, fall back to i64, then null
-                    let val = if let Ok(v) = row.get::<_, String>(i) {
-                        serde_json::Value::String(v)
-                    } else if let Ok(v) = row.get::<_, i64>(i) {
-                        serde_json::Value::Number(v.into())
-                    } else if let Ok(v) = row.get::<_, f64>(i) {
-                        serde_json::json!(v)
-                    } else {
-                        serde_json::Value::Null
-                    };
-                    map.insert(name.clone(), val);
-                }
-                Ok(serde_json::Value::Object(map))
-            })
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Query error: {}", e),
-                )
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Query error: {}", e),
-                )
-            })?,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("journal_logs") {
-                Vec::new()
-            } else {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Query error: {}", e),
-                ));
-            }
-        }
-    };
+    let results: Vec<serde_json::Value> = state
+        .buffer
+        .lock()
+        .unwrap()
+        .query_json_rows(&sql, &display_names)
+        .unwrap_or_default();
 
     let total = results.len();
     let query_time_ms = start_time.elapsed().as_millis();
@@ -720,25 +642,15 @@ async fn api_search(
 async fn api_filters(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FilterValues>, (StatusCode, String)> {
-    let conn = state.conn.lock().unwrap();
-
     // Get distinct hostnames
-    let hostnames: Vec<String> = conn
-        .prepare("SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let hostnames = state.buffer.lock().unwrap().query_distinct_strings(
+        "SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname",
+    );
 
     // Get distinct units
-    let units: Vec<String> = conn
-        .prepare("SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let units = state.buffer.lock().unwrap().query_distinct_strings(
+        "SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit",
+    );
 
     // Static priority options
     let priorities: Vec<PriorityOption> = (0..=7)
@@ -767,10 +679,9 @@ async fn search_ui(
     let end = parse_time(&params.end, now).unwrap_or(now);
 
     let limit = params.limit.min(100_000);
-    let conn = state.conn.lock().unwrap();
 
     // Determine which columns to select
-    let schema = get_schema_columns(&conn);
+    let schema = get_schema_columns(&state.buffer);
     let requested_cols: Vec<&str> = if let Some(ref cols) = params.columns
         && !cols.is_empty()
     {
@@ -880,34 +791,14 @@ async fn search_ui(
     ));
 
     // Get total count
-    let total_count: usize = conn
-        .prepare(&count_sql)
-        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
-        .unwrap_or(0);
+    let total_count = state.buffer.lock().unwrap().query_usize(&count_sql);
 
     // Execute main query with dynamic columns
-    let col_count = select_list.len();
-    let results: Vec<serde_json::Value> = conn
-        .prepare(&sql)
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                let mut map = serde_json::Map::new();
-                for (i, name) in display_names.iter().enumerate().take(col_count) {
-                    let val = if let Ok(v) = row.get::<_, String>(i) {
-                        serde_json::Value::String(v)
-                    } else if let Ok(v) = row.get::<_, i64>(i) {
-                        serde_json::Value::Number(v.into())
-                    } else if let Ok(v) = row.get::<_, f64>(i) {
-                        serde_json::json!(v)
-                    } else {
-                        serde_json::Value::Null
-                    };
-                    map.insert(name.clone(), val);
-                }
-                Ok(serde_json::Value::Object(map))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
+    let results = state
+        .buffer
+        .lock()
+        .unwrap()
+        .query_json_rows(&sql, &display_names)
         .unwrap_or_default();
 
     // Build histogram queries for both minute and hour granularity
@@ -955,18 +846,7 @@ async fn search_ui(
             bin_unit, hist_where
         );
 
-        let rows: Vec<serde_json::Value> = conn
-            .prepare(&hist_sql)
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| {
-                    Ok(serde_json::json!({
-                        "bin": row.get::<_, String>(0)?,
-                        "count": row.get::<_, i64>(1)?,
-                    }))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default();
+        let rows = state.buffer.lock().unwrap().query_histogram_rows(&hist_sql);
 
         histogram_both.insert(bin_unit.to_string(), serde_json::Value::Array(rows));
     }
@@ -984,21 +864,13 @@ async fn search_ui(
     };
 
     // Get filter options
-    let hostnames: Vec<String> = conn
-        .prepare("SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let hostnames = state.buffer.lock().unwrap().query_distinct_strings(
+        "SELECT DISTINCT _hostname FROM journal_logs WHERE _hostname IS NOT NULL ORDER BY _hostname",
+    );
 
-    let units: Vec<String> = conn
-        .prepare("SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let units = state.buffer.lock().unwrap().query_distinct_strings(
+        "SELECT DISTINCT _systemd_unit FROM journal_logs WHERE _systemd_unit IS NOT NULL ORDER BY _systemd_unit",
+    );
 
     // Build HTML
     let start_iso = start.to_rfc3339();
@@ -2054,10 +1926,10 @@ fn url_encode(s: &str) -> String {
 fn create_test_app(data_dir: &str) -> Router {
     let process_monitor = Arc::new(ProcessMonitor::new());
     let settings = Settings::default();
-    let state = Arc::new(
-        AppState::new(data_dir, process_monitor, settings)
-            .expect("Failed to create test app state"),
-    );
+    let buffer = Arc::new(Mutex::new(
+        DuckDBBuffer::new(data_dir).expect("Failed to create test buffer"),
+    ));
+    let state = Arc::new(AppState::new(data_dir, buffer, process_monitor, settings));
     Router::new()
         .route("/", get(search_ui))
         .route("/api/search", get(api_search))

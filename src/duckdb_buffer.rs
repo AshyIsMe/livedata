@@ -1,17 +1,37 @@
 use crate::log_entry::LogEntry;
 use crate::process_monitor::ProcessInfo;
+use crate::sql_trace::trace_sql;
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
 use duckdb::{Connection, params};
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct DuckDBBuffer {
-    pub conn: Connection,
+    conn: Connection,
     db_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct ProcessMetricRecord {
+    pub timestamp: String,
+    pub pid: u32,
+    pub name: String,
+    pub cpu_usage: f32,
+    pub mem_usage: f64,
+    pub user: Option<String>,
+    pub runtime: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct StorageStats {
+    pub journal_log_count: i64,
+    pub process_metric_count: i64,
+    pub oldest_log_timestamp: Option<String>,
+    pub newest_log_timestamp: Option<String>,
 }
 
 /// Schema version for tracking migrations
@@ -24,13 +44,7 @@ impl DuckDBBuffer {
         // Ensure data directory exists
         fs::create_dir_all(data_dir)?;
 
-        let db_path = data_dir.join("livedata.duckdb");
-        info!(
-            "Initializing DuckDB on-disk database at: {}",
-            db_path.display()
-        );
-
-        let conn = Connection::open(&db_path)?;
+        let (conn, db_path) = Self::open_connection(data_dir)?;
 
         // Initialize schema versioning and run migrations
         Self::initialize_schema_versioning(&conn)?;
@@ -44,8 +58,282 @@ impl DuckDBBuffer {
         Ok(Self { conn, db_path })
     }
 
+    pub fn open_without_migrations<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
+        let data_dir = data_dir.as_ref();
+
+        // Ensure data directory exists
+        fs::create_dir_all(data_dir)?;
+
+        let (conn, db_path) = Self::open_connection(data_dir)?;
+
+        Ok(Self { conn, db_path })
+    }
+
+    /// Run retention cleanup once against an existing database.
+    pub fn cleanup<P: AsRef<Path>>(
+        data_dir: P,
+        log_retention_days: u32,
+        log_max_size_gb: f64,
+        process_retention_days: u32,
+        process_max_size_gb: f64,
+    ) -> Result<RetentionStats> {
+        let mut buffer = Self::open_without_migrations(data_dir)?;
+        buffer.enforce_retention(
+            log_retention_days,
+            log_max_size_gb,
+            process_retention_days,
+            process_max_size_gb,
+        )
+    }
+
+    pub fn begin_transaction(&mut self) -> Result<()> {
+        trace_sql("BEGIN TRANSACTION");
+        self.conn.execute("BEGIN TRANSACTION", [])?;
+        Ok(())
+    }
+
+    pub fn commit_transaction(&mut self) -> Result<()> {
+        trace_sql("COMMIT");
+        self.conn.execute("COMMIT", [])?;
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&mut self) -> Result<()> {
+        trace_sql("ROLLBACK");
+        self.conn.execute("ROLLBACK", [])?;
+        Ok(())
+    }
+
+    pub fn checkpoint(&mut self) -> Result<()> {
+        trace_sql("FORCE CHECKPOINT");
+        self.conn.execute("FORCE CHECKPOINT", [])?;
+        Ok(())
+    }
+
+    pub fn get_latest_process_timestamp(&mut self) -> Result<Option<String>> {
+        trace_sql("SELECT MAX(timestamp) FROM process_metrics");
+        let mut stmt = self
+            .conn
+            .prepare("SELECT MAX(timestamp) FROM process_metrics")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let ts: Option<String> = row.get(0)?;
+            Ok(ts)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_process_metrics_for_timestamp(
+        &mut self,
+        timestamp: &str,
+    ) -> Result<Vec<ProcessMetricRecord>> {
+        trace_sql(
+            "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime
+             FROM process_metrics
+             WHERE timestamp = ?",
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime
+             FROM process_metrics
+             WHERE timestamp = ?",
+        )?;
+
+        let rows = stmt.query_map([timestamp], |row| {
+            Ok(ProcessMetricRecord {
+                timestamp: row.get(0)?,
+                pid: row.get::<_, i64>(1)? as u32,
+                name: row.get(2)?,
+                cpu_usage: row.get::<_, f64>(3)? as f32,
+                mem_usage: row.get(4)?,
+                user: row.get(5)?,
+                runtime: row.get::<_, i64>(6)? as u64,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_storage_stats(&mut self) -> Result<StorageStats> {
+        trace_sql("SELECT COUNT(*) FROM journal_logs");
+        let journal_log_count: i64 = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM journal_logs")?
+            .query_row([], |row| row.get(0))
+            .unwrap_or(0);
+
+        trace_sql("SELECT COUNT(*) FROM process_metrics");
+        let process_metric_count: i64 = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM process_metrics")?
+            .query_row([], |row| row.get(0))
+            .unwrap_or(0);
+
+        trace_sql("SELECT MIN(timestamp) FROM journal_logs");
+        let oldest_log_timestamp: Option<String> = self
+            .conn
+            .prepare("SELECT MIN(timestamp) FROM journal_logs")?
+            .query_row([], |row| row.get(0))
+            .ok();
+
+        trace_sql("SELECT MAX(timestamp) FROM journal_logs");
+        let newest_log_timestamp: Option<String> = self
+            .conn
+            .prepare("SELECT MAX(timestamp) FROM journal_logs")?
+            .query_row([], |row| row.get(0))
+            .ok();
+
+        Ok(StorageStats {
+            journal_log_count,
+            process_metric_count,
+            oldest_log_timestamp,
+            newest_log_timestamp,
+        })
+    }
+
+    pub fn get_schema_columns(&mut self) -> Vec<(String, String)> {
+        trace_sql("DESCRIBE journal_logs");
+        self.conn
+            .prepare("DESCRIBE journal_logs")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn query_json_rows(
+        &mut self,
+        sql: &str,
+        display_names: &[String],
+    ) -> Result<Vec<serde_json::Value>> {
+        let col_count = display_names.len();
+        trace_sql(sql);
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let mut map = serde_json::Map::new();
+            for (i, name) in display_names.iter().enumerate().take(col_count) {
+                let val = if let Ok(v) = row.get::<_, String>(i) {
+                    serde_json::Value::String(v)
+                } else if let Ok(v) = row.get::<_, i64>(i) {
+                    serde_json::Value::Number(v.into())
+                } else if let Ok(v) = row.get::<_, f64>(i) {
+                    serde_json::json!(v)
+                } else {
+                    serde_json::Value::Null
+                };
+                map.insert(name.clone(), val);
+            }
+            Ok(serde_json::Value::Object(map))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn query_usize(&mut self, sql: &str) -> usize {
+        trace_sql(sql);
+        self.conn
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+            .unwrap_or(0)
+    }
+
+    pub fn query_distinct_strings(&mut self, sql: &str) -> Vec<String> {
+        trace_sql(sql);
+        self.conn
+            .prepare(sql)
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn query_histogram_rows(&mut self, sql: &str) -> Vec<serde_json::Value> {
+        trace_sql(sql);
+        self.conn
+            .prepare(sql)
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "bin": row.get::<_, String>(0)?,
+                        "count": row.get::<_, i64>(1)?,
+                    }))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    fn open_connection(data_dir: &Path) -> Result<(Connection, PathBuf)> {
+        let db_path = data_dir.join("livedata.duckdb");
+        info!("Opening DuckDB on-disk database at: {}", db_path.display());
+
+        let conn = match Connection::open(&db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(
+                    "Failed to open DuckDB database at {}: {}",
+                    db_path.display(),
+                    e
+                );
+                Self::recover_corrupt_db(data_dir, &db_path)?;
+                Connection::open(&db_path)?
+            }
+        };
+
+        Ok((conn, db_path))
+    }
+
+    fn recover_corrupt_db(data_dir: &Path, db_path: &Path) -> Result<()> {
+        if !db_path.exists() {
+            return Ok(());
+        }
+
+        let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
+        let corrupt_path = data_dir.join(format!("livedata.duckdb.corrupt-{}", ts));
+        fs::rename(db_path, &corrupt_path)?;
+        warn!("Moved corrupted database to: {}", corrupt_path.display());
+
+        let backup_path = data_dir.join("livedata.duckdb.bak");
+        if backup_path.exists() {
+            match Connection::open(&backup_path) {
+                Ok(conn) => {
+                    drop(conn);
+                    fs::copy(&backup_path, db_path)?;
+                    info!(
+                        "Restored DuckDB database from backup: {}",
+                        backup_path.display()
+                    );
+                }
+                Err(e) => {
+                    warn!("Backup database is also invalid ({}), starting fresh", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Initialize schema versioning table
     fn initialize_schema_versioning(conn: &Connection) -> Result<()> {
+        trace_sql(
+            "CREATE TABLE IF NOT EXISTS _schema_version (\
+                version INTEGER PRIMARY KEY,\
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\
+                description TEXT\
+            )",
+        );
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _schema_version (
                 version INTEGER PRIMARY KEY,
@@ -60,6 +348,7 @@ impl DuckDBBuffer {
 
     /// Get current schema version from database
     fn get_current_version(conn: &Connection) -> Result<i32> {
+        trace_sql("SELECT MAX(version) FROM _schema_version");
         let mut stmt = conn.prepare("SELECT MAX(version) FROM _schema_version")?;
         let mut rows = stmt.query([])?;
 
@@ -73,6 +362,7 @@ impl DuckDBBuffer {
 
     /// Record a migration as applied
     fn record_migration(conn: &Connection, version: i32, description: &str) -> Result<()> {
+        trace_sql("INSERT INTO _schema_version (version, description) VALUES (?, ?)");
         conn.execute(
             "INSERT INTO _schema_version (version, description) VALUES (?, ?)",
             params![version, description],
@@ -107,6 +397,92 @@ impl DuckDBBuffer {
     /// Migration 001: Create process_metrics table and ensure journal_logs exists
     fn migration_001(conn: &Connection) -> Result<()> {
         // Ensure journal_logs table exists (may already exist from old code)
+        trace_sql(
+            "CREATE TABLE IF NOT EXISTS journal_logs (
+                timestamp TIMESTAMP NOT NULL,
+                minute_key VARCHAR NOT NULL,
+                -- User journal fields
+                message TEXT,
+                message_id TEXT,
+                priority INTEGER,
+                code_file TEXT,
+                code_line INTEGER,
+                code_func TEXT,
+                errno INTEGER,
+                invocation_id TEXT,
+                user_invocation_id TEXT,
+                syslog_facility INTEGER,
+                syslog_identifier TEXT,
+                syslog_pid INTEGER,
+                syslog_timestamp TEXT,
+                syslog_raw TEXT,
+                documentation TEXT,
+                tid INTEGER,
+                unit TEXT,
+                user_unit TEXT,
+                -- Trusted journal fields
+                _PID INTEGER,
+                _UID INTEGER,
+                _GID INTEGER,
+                _COMM TEXT,
+                _EXE TEXT,
+                _CMDLINE TEXT,
+                _CAP_EFFECTIVE TEXT,
+                _AUDIT_SESSION INTEGER,
+                _AUDIT_LOGINUID INTEGER,
+                _SYSTEMD_CGROUP TEXT,
+                _SYSTEMD_SLICE TEXT,
+                _SYSTEMD_UNIT TEXT,
+                _SYSTEMD_USER_UNIT TEXT,
+                _SYSTEMD_USER_SLICE TEXT,
+                _SYSTEMD_SESSION TEXT,
+                _SYSTEMD_OWNER_UID INTEGER,
+                _SELINUX_CONTEXT TEXT,
+                _SOURCE_REALTIME_TIMESTAMP BIGINT,
+                _SOURCE_BOOTTIME_TIMESTAMP BIGINT,
+                _BOOT_ID TEXT,
+                _MACHINE_ID TEXT,
+                _SYSTEMD_INVOCATION_ID TEXT,
+                _HOSTNAME TEXT,
+                _TRANSPORT TEXT,
+                _STREAM_ID TEXT,
+                _LINE_BREAK TEXT,
+                _NAMESPACE TEXT,
+                _RUNTIME_SCOPE TEXT,
+                -- Kernel journal fields
+                _KERNEL_DEVICE TEXT,
+                _KERNEL_SUBSYSTEM TEXT,
+                _UDEV_SYSNAME TEXT,
+                _UDEV_DEVNODE TEXT,
+                _UDEV_DEVLINK TEXT,
+                -- Fields to log on behalf of another program
+                COREDUMP_UNIT TEXT,
+                COREDUMP_USER_UNIT TEXT,
+                OBJECT_PID INTEGER,
+                OBJECT_UID INTEGER,
+                OBJECT_GID INTEGER,
+                OBJECT_COMM TEXT,
+                OBJECT_EXE TEXT,
+                OBJECT_CMDLINE TEXT,
+                OBJECT_AUDIT_SESSION INTEGER,
+                OBJECT_AUDIT_LOGINUID INTEGER,
+                OBJECT_SYSTEMD_CGROUP TEXT,
+                OBJECT_SYSTEMD_SESSION TEXT,
+                OBJECT_SYSTEMD_OWNER_UID INTEGER,
+                OBJECT_SYSTEMD_UNIT TEXT,
+                OBJECT_SYSTEMD_USER_UNIT TEXT,
+                OBJECT_SYSTEMD_USER_SLICE TEXT,
+                OBJECT_SYSTEMD_INVOCATION_ID TEXT,
+                -- Address fields (for serialization metadata)
+                __CURSOR TEXT,
+                __REALTIME_TIMESTAMP BIGINT,
+                __MONOTONIC_TIMESTAMP BIGINT,
+                __SEQNUM BIGINT,
+                __SEQNUM_ID BIGINT,
+                -- Fallback for any custom fields not in systemd spec
+                extra_fields JSON
+            )",
+        );
         conn.execute(
             "CREATE TABLE IF NOT EXISTS journal_logs (
                 timestamp TIMESTAMP NOT NULL,
@@ -196,28 +572,45 @@ impl DuckDBBuffer {
         )?;
 
         // Ensure journal_logs indexes exist
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_minute_key ON journal_logs(minute_key)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_minute_key ON journal_logs(minute_key)",
             [],
         )?;
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_timestamp ON journal_logs(timestamp)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_timestamp ON journal_logs(timestamp)",
             [],
         )?;
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_priority ON journal_logs(priority)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_priority ON journal_logs(priority)",
             [],
         )?;
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_hostname ON journal_logs(_HOSTNAME)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_hostname ON journal_logs(_HOSTNAME)",
             [],
         )?;
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_systemd_unit ON journal_logs(_SYSTEMD_UNIT)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_systemd_unit ON journal_logs(_SYSTEMD_UNIT)",
             [],
         )?;
 
         // Create process_metrics table
+        trace_sql(
+            "CREATE TABLE IF NOT EXISTS process_metrics (
+                timestamp TIMESTAMP NOT NULL,
+                pid INTEGER NOT NULL,
+                name TEXT,
+                cpu_usage DOUBLE,
+                mem_usage DOUBLE,
+                user TEXT,
+                runtime BIGINT,
+                PRIMARY KEY (timestamp, pid)
+            )",
+        );
         conn.execute(
             "CREATE TABLE IF NOT EXISTS process_metrics (
                 timestamp TIMESTAMP NOT NULL,
@@ -233,14 +626,17 @@ impl DuckDBBuffer {
         )?;
 
         // Create indexes for process_metrics
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_process_timestamp ON process_metrics(timestamp)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_process_timestamp ON process_metrics(timestamp)",
             [],
         )?;
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_process_pid ON process_metrics(pid)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_process_pid ON process_metrics(pid)",
             [],
         )?;
+        trace_sql("CREATE INDEX IF NOT EXISTS idx_process_name ON process_metrics(name)");
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_process_name ON process_metrics(name)",
             [],
@@ -476,125 +872,93 @@ impl DuckDBBuffer {
             Some(serde_json::to_string(&extra_fields)?)
         };
 
-        self.conn.execute(
-            "INSERT INTO journal_logs (
-                timestamp, minute_key,
-                -- User journal fields
-                message, message_id, priority, code_file, code_line, code_func, errno,
-                invocation_id, user_invocation_id, syslog_facility, syslog_identifier,
-                syslog_pid, syslog_timestamp, syslog_raw, documentation, tid, unit, user_unit,
-                -- Trusted journal fields
-                _PID, _UID, _GID, _COMM, _EXE, _CMDLINE, _CAP_EFFECTIVE, _AUDIT_SESSION,
-                _AUDIT_LOGINUID, _SYSTEMD_CGROUP, _SYSTEMD_SLICE, _SYSTEMD_UNIT,
-                _SYSTEMD_USER_UNIT, _SYSTEMD_USER_SLICE, _SYSTEMD_SESSION, _SYSTEMD_OWNER_UID,
-                _SELINUX_CONTEXT, _SOURCE_REALTIME_TIMESTAMP, _SOURCE_BOOTTIME_TIMESTAMP,
-                _BOOT_ID, _MACHINE_ID, _SYSTEMD_INVOCATION_ID, _HOSTNAME, _TRANSPORT,
-                _STREAM_ID, _LINE_BREAK, _NAMESPACE, _RUNTIME_SCOPE,
-                -- Kernel journal fields
-                _KERNEL_DEVICE, _KERNEL_SUBSYSTEM, _UDEV_SYSNAME, _UDEV_DEVNODE, _UDEV_DEVLINK,
-                 -- Fields to log on behalf of another program
-                 COREDUMP_UNIT, COREDUMP_USER_UNIT, OBJECT_PID, OBJECT_UID, OBJECT_GID,
-                 OBJECT_COMM, OBJECT_EXE, OBJECT_CMDLINE, OBJECT_AUDIT_SESSION,
-                 OBJECT_AUDIT_LOGINUID, OBJECT_SYSTEMD_CGROUP, OBJECT_SYSTEMD_SESSION,
-                 OBJECT_SYSTEMD_OWNER_UID, OBJECT_SYSTEMD_UNIT, OBJECT_SYSTEMD_USER_UNIT,
-                 OBJECT_SYSTEMD_USER_SLICE, OBJECT_SYSTEMD_INVOCATION_ID,
-                    -- Address fields
-                    __CURSOR, __REALTIME_TIMESTAMP, __MONOTONIC_TIMESTAMP, __SEQNUM, __SEQNUM_ID,
-                -- Extra fields
-                extra_fields
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?
-            )",
-            params![
-                entry.timestamp.to_rfc3339(),
-                minute_key.to_rfc3339(),
-                // User journal fields
-                message,
-                message_id,
-                priority,
-                code_file,
-                code_line,
-                code_func,
-                errno,
-                invocation_id,
-                user_invocation_id,
-                syslog_facility,
-                syslog_identifier,
-                syslog_pid,
-                syslog_timestamp,
-                syslog_raw,
-                documentation,
-                tid,
-                unit,
-                user_unit,
-                // Trusted journal fields
-                _pid,
-                _uid,
-                _gid,
-                _comm,
-                _exe,
-                _cmdline,
-                _cap_effective,
-                _audit_session,
-                _audit_loginuid,
-                _systemd_cgroup,
-                _systemd_slice,
-                _systemd_unit,
-                _systemd_user_unit,
-                _systemd_user_slice,
-                _systemd_session,
-                _systemd_owner_uid,
-                _selinux_context,
-                _source_realtime_timestamp,
-                _source_boottime_timestamp,
-                _boot_id,
-                _machine_id,
-                _systemd_invocation_id,
-                _hostname,
-                _transport,
-                _stream_id,
-                _line_break,
-                _namespace,
-                _runtime_scope,
-                // Kernel journal fields
-                _kernel_device,
-                _kernel_subsystem,
-                _udev_sysname,
-                _udev_devnode,
-                _udev_devlink,
-                // Fields to log on behalf of another program
-                coredump_unit,
-                coredump_user_unit,
-                object_pid,
-                object_uid,
-                object_gid,
-                object_comm,
-                object_exe,
-                object_cmdline,
-                object_audit_session,
-                object_audit_loginuid,
-                object_systemd_cgroup,
-                object_systemd_session,
-                object_systemd_owner_uid,
-                object_systemd_unit,
-                object_systemd_user_unit,
-                object_systemd_user_slice,
-                object_systemd_invocation_id,
-                // Address fields
-                __cursor,
-                __realtime_timestamp,
-                __monotonic_timestamp,
-                __seqnum,
-                __seqnum_id,
-                // Extra fields
-                extra_fields_json
-            ],
-        )?;
+        trace_sql("APPENDER journal_logs");
+        let mut appender = self.conn.appender("journal_logs")?;
+        appender.append_row(params![
+            entry.timestamp.to_rfc3339(),
+            minute_key.to_rfc3339(),
+            // User journal fields
+            message,
+            message_id,
+            priority,
+            code_file,
+            code_line,
+            code_func,
+            errno,
+            invocation_id,
+            user_invocation_id,
+            syslog_facility,
+            syslog_identifier,
+            syslog_pid,
+            syslog_timestamp,
+            syslog_raw,
+            documentation,
+            tid,
+            unit,
+            user_unit,
+            // Trusted journal fields
+            _pid,
+            _uid,
+            _gid,
+            _comm,
+            _exe,
+            _cmdline,
+            _cap_effective,
+            _audit_session,
+            _audit_loginuid,
+            _systemd_cgroup,
+            _systemd_slice,
+            _systemd_unit,
+            _systemd_user_unit,
+            _systemd_user_slice,
+            _systemd_session,
+            _systemd_owner_uid,
+            _selinux_context,
+            _source_realtime_timestamp,
+            _source_boottime_timestamp,
+            _boot_id,
+            _machine_id,
+            _systemd_invocation_id,
+            _hostname,
+            _transport,
+            _stream_id,
+            _line_break,
+            _namespace,
+            _runtime_scope,
+            // Kernel journal fields
+            _kernel_device,
+            _kernel_subsystem,
+            _udev_sysname,
+            _udev_devnode,
+            _udev_devlink,
+            // Fields to log on behalf of another program
+            coredump_unit,
+            coredump_user_unit,
+            object_pid,
+            object_uid,
+            object_gid,
+            object_comm,
+            object_exe,
+            object_cmdline,
+            object_audit_session,
+            object_audit_loginuid,
+            object_systemd_cgroup,
+            object_systemd_session,
+            object_systemd_owner_uid,
+            object_systemd_unit,
+            object_systemd_user_unit,
+            object_systemd_user_slice,
+            object_systemd_invocation_id,
+            // Address fields
+            __cursor,
+            __realtime_timestamp,
+            __monotonic_timestamp,
+            __seqnum,
+            __seqnum_id,
+            // Extra fields
+            extra_fields_json
+        ])?;
+        appender.flush()?;
 
         Ok(())
     }
@@ -609,11 +973,8 @@ impl DuckDBBuffer {
             return Ok(());
         }
 
-        // Batch insert all process metrics
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO process_metrics (timestamp, pid, name, cpu_usage, mem_usage, user, runtime)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )?;
+        trace_sql("APPENDER process_metrics");
+        let mut appender = self.conn.appender("process_metrics")?;
 
         for process in processes {
             // Extract numeric UID from "Uid(1234)" format
@@ -624,7 +985,7 @@ impl DuckDBBuffer {
                     .map(|s| s.to_string())
             });
 
-            stmt.execute(params![
+            appender.append_row(params![
                 timestamp.to_rfc3339(),
                 process.pid as i32,
                 process.name,
@@ -634,6 +995,7 @@ impl DuckDBBuffer {
                 process.runtime_secs as i64,
             ])?;
         }
+        appender.flush()?;
 
         Ok(())
     }
@@ -643,6 +1005,33 @@ impl DuckDBBuffer {
         minute_key: DateTime<Utc>,
     ) -> Result<Vec<(DateTime<Utc>, Value)>> {
         let mut entries = Vec::new();
+        trace_sql(
+            "SELECT CAST(timestamp AS VARCHAR),
+                    -- User journal fields
+                    message, message_id, priority, code_file, code_line, code_func, errno,
+                    invocation_id, user_invocation_id, syslog_facility, syslog_identifier,
+                    syslog_pid, syslog_timestamp, syslog_raw, documentation, tid, unit, user_unit,
+                    -- Trusted journal fields
+                    _PID, _UID, _GID, _COMM, _EXE, _CMDLINE, _CAP_EFFECTIVE, _AUDIT_SESSION,
+                    _AUDIT_LOGINUID, _SYSTEMD_CGROUP, _SYSTEMD_SLICE, _SYSTEMD_UNIT,
+                    _SYSTEMD_USER_UNIT, _SYSTEMD_USER_SLICE, _SYSTEMD_SESSION, _SYSTEMD_OWNER_UID,
+                    _SELINUX_CONTEXT, _SOURCE_REALTIME_TIMESTAMP, _SOURCE_BOOTTIME_TIMESTAMP,
+                    _BOOT_ID, _MACHINE_ID, _SYSTEMD_INVOCATION_ID, _HOSTNAME, _TRANSPORT,
+                    _STREAM_ID, _LINE_BREAK, _NAMESPACE, _RUNTIME_SCOPE,
+                    -- Kernel journal fields
+                    _KERNEL_DEVICE, _KERNEL_SUBSYSTEM, _UDEV_SYSNAME, _UDEV_DEVNODE, _UDEV_DEVLINK,
+                     -- Fields to log on behalf of another program
+                     COREDUMP_UNIT, COREDUMP_USER_UNIT, OBJECT_PID, OBJECT_UID, OBJECT_GID,
+                     OBJECT_COMM, OBJECT_EXE, OBJECT_CMDLINE, OBJECT_AUDIT_SESSION,
+                     OBJECT_AUDIT_LOGINUID, OBJECT_SYSTEMD_CGROUP, OBJECT_SYSTEMD_SESSION,
+                     OBJECT_SYSTEMD_OWNER_UID, OBJECT_SYSTEMD_UNIT, OBJECT_SYSTEMD_USER_UNIT,
+                     OBJECT_SYSTEMD_USER_SLICE, OBJECT_SYSTEMD_INVOCATION_ID,
+                    -- Address fields
+                __CURSOR, __REALTIME_TIMESTAMP, __MONOTONIC_TIMESTAMP, __SEQNUM, __SEQNUM_ID,
+                    -- Extra fields
+                    extra_fields
+              FROM journal_logs WHERE minute_key = ? ORDER BY timestamp",
+        );
         let mut stmt = self.conn.prepare(
             "SELECT CAST(timestamp AS VARCHAR),
                     -- User journal fields
@@ -809,6 +1198,7 @@ impl DuckDBBuffer {
     }
 
     pub fn delete_minute(&mut self, minute_key: DateTime<Utc>) -> Result<usize> {
+        trace_sql("DELETE FROM journal_logs WHERE minute_key = ?");
         let rows_deleted = self.conn.execute(
             "DELETE FROM journal_logs WHERE minute_key = ?",
             params![minute_key.to_rfc3339()],
@@ -818,6 +1208,7 @@ impl DuckDBBuffer {
 
     pub fn get_buffered_minutes(&mut self) -> Result<HashSet<DateTime<Utc>>> {
         let mut minutes = HashSet::new();
+        trace_sql("SELECT DISTINCT minute_key FROM journal_logs");
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT minute_key FROM journal_logs")?;
@@ -837,6 +1228,7 @@ impl DuckDBBuffer {
     }
 
     pub fn count_entries(&mut self) -> Result<i64> {
+        trace_sql("SELECT COUNT(*) FROM journal_logs");
         let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM journal_logs")?;
         let mut rows = stmt.query([])?;
 
@@ -848,6 +1240,7 @@ impl DuckDBBuffer {
     }
 
     pub fn count_entries_for_minute(&mut self, minute_key: DateTime<Utc>) -> Result<i64> {
+        trace_sql("SELECT COUNT(*) FROM journal_logs WHERE minute_key = ?");
         let mut stmt = self
             .conn
             .prepare("SELECT COUNT(*) FROM journal_logs WHERE minute_key = ?")?;
@@ -861,6 +1254,7 @@ impl DuckDBBuffer {
     }
 
     pub fn get_oldest_minute(&mut self) -> Result<Option<DateTime<Utc>>> {
+        trace_sql("SELECT MIN(minute_key) FROM journal_logs");
         let mut stmt = self
             .conn
             .prepare("SELECT MIN(minute_key) FROM journal_logs")?;
@@ -885,6 +1279,7 @@ impl DuckDBBuffer {
     }
 
     pub fn get_newest_minute(&mut self) -> Result<Option<DateTime<Utc>>> {
+        trace_sql("SELECT MAX(minute_key) FROM journal_logs");
         let mut stmt = self
             .conn
             .prepare("SELECT MAX(minute_key) FROM journal_logs")?;
@@ -910,12 +1305,14 @@ impl DuckDBBuffer {
 
     pub fn clear_all(&mut self) -> Result<()> {
         debug!("Clearing all buffered entries");
+        trace_sql("DELETE FROM journal_logs");
         self.conn.execute("DELETE FROM journal_logs", [])?;
         Ok(())
     }
 
     pub fn vacuum(&mut self) -> Result<()> {
         debug!("Running VACUUM to optimize database");
+        trace_sql("VACUUM");
         self.conn.execute("VACUUM", [])?;
         Ok(())
     }
@@ -948,6 +1345,7 @@ impl DuckDBBuffer {
 
         // Time-based cleanup for journal_logs
         let log_cutoff = Utc::now() - TimeDelta::days(log_retention_days as i64);
+        trace_sql("DELETE FROM journal_logs WHERE timestamp < ?");
         let log_time_deleted = self.conn.execute(
             "DELETE FROM journal_logs WHERE timestamp < ?",
             params![log_cutoff.to_rfc3339()],
@@ -962,6 +1360,7 @@ impl DuckDBBuffer {
 
         // Time-based cleanup for process_metrics
         let process_cutoff = Utc::now() - TimeDelta::days(process_retention_days as i64);
+        trace_sql("DELETE FROM process_metrics WHERE timestamp < ?");
         let process_time_deleted = self.conn.execute(
             "DELETE FROM process_metrics WHERE timestamp < ?",
             params![process_cutoff.to_rfc3339()],
@@ -992,6 +1391,13 @@ impl DuckDBBuffer {
                     break;
                 }
 
+                trace_sql(
+                    "DELETE FROM journal_logs WHERE timestamp IN (
+                        SELECT timestamp FROM journal_logs ORDER BY timestamp ASC LIMIT (
+                            SELECT COUNT(*) / 10 FROM journal_logs
+                        )
+                    )",
+                );
                 let deleted = self.conn.execute(
                     "DELETE FROM journal_logs WHERE timestamp IN (
                         SELECT timestamp FROM journal_logs ORDER BY timestamp ASC LIMIT (
@@ -1028,6 +1434,13 @@ impl DuckDBBuffer {
                     break;
                 }
 
+                trace_sql(
+                    "DELETE FROM process_metrics WHERE timestamp IN (
+                        SELECT timestamp FROM process_metrics ORDER BY timestamp ASC LIMIT (
+                            SELECT COUNT(*) / 10 FROM process_metrics
+                        )
+                    )",
+                );
                 let deleted = self.conn.execute(
                     "DELETE FROM process_metrics WHERE timestamp IN (
                         SELECT timestamp FROM process_metrics ORDER BY timestamp ASC LIMIT (

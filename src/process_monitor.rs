@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use sysinfo::{ProcessesToUpdate, System};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 
 /// Process information snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,15 +81,22 @@ impl ProcessMonitor {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
             rt.block_on(async move {
-                let mut ticker = interval(Duration::from_secs(interval_secs));
-
                 loop {
                     if shutdown_signal.load(Ordering::Relaxed) {
                         log::info!("Process monitor shutting down");
                         break;
                     }
 
-                    ticker.tick().await;
+                    // Sleep in short slices so shutdown can interrupt promptly.
+                    let mut remaining_ms = interval_secs.saturating_mul(1000);
+                    while remaining_ms > 0 {
+                        if shutdown_signal.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let step_ms = remaining_ms.min(100);
+                        tokio::time::sleep(Duration::from_millis(step_ms)).await;
+                        remaining_ms = remaining_ms.saturating_sub(step_ms);
+                    }
 
                     if shutdown_signal.load(Ordering::Relaxed) {
                         log::info!("Process monitor shutting down");
