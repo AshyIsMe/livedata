@@ -978,6 +978,30 @@ fn build_search_html(
     <title>Livedata - Log Search</title>
     <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <style>
+        :root {{
+            --bg: #272822;
+            --surface: #2d2e27;
+            --surface-alt: #3e3d32;
+            --text: #f8f8f2;
+            --muted: #a59f85;
+            --border: #49483e;
+            --accent: #a6e22e;
+            --accent-2: #66d9ef;
+            --warn: #fd971f;
+            --danger: #f92672;
+        }}
+        body.theme-light {{
+            --bg: #f8f8f2;
+            --surface: #efefe7;
+            --surface-alt: #ffffff;
+            --text: #272822;
+            --muted: #6f6b57;
+            --border: #b7b39e;
+            --accent: #3b7d15;
+            --accent-2: #0f8395;
+            --warn: #c15d00;
+            --danger: #c2175b;
+        }}
         * {{
             box-sizing: border-box;
             margin: 0;
@@ -985,13 +1009,13 @@ fn build_search_html(
         }}
         body {{
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background-color: #1a1a2e;
-            color: #eee;
+            background-color: var(--bg);
+            color: var(--text);
             line-height: 1.5;
         }}
         .global-header {{
-            background-color: #0f3460;
-            border-bottom: 2px solid #00d9ff;
+            background-color: var(--surface);
+            border-bottom: 2px solid var(--accent);
             margin-bottom: 0;
         }}
         .global-header nav {{
@@ -1001,7 +1025,7 @@ fn build_search_html(
             max-width: 100%;
         }}
         .global-header nav a {{
-            color: #00d9ff;
+            color: var(--accent-2);
             text-decoration: none;
             font-size: 15px;
             font-weight: 500;
@@ -1010,48 +1034,48 @@ fn build_search_html(
             transition: background-color 0.2s;
         }}
         .global-header nav a:hover {{
-            background-color: #16213e;
+            background-color: var(--surface-alt);
         }}
         .global-header nav a.active {{
-            background-color: #00d9ff;
-            color: #1a1a2e;
+            background-color: var(--accent);
+            color: var(--bg);
         }}
         .container {{
             max-width: 100%;
             padding: 20px;
         }}
         #storage-health {{
-            background-color: #16213e;
+            background-color: var(--surface);
             padding: 12px 20px;
             border-radius: 8px;
             margin-bottom: 20px;
             font-size: 0.9rem;
-            border: 1px solid #0f3460;
+            border: 1px solid var(--border);
         }}
         #storage-health .health-item {{
             display: inline-block;
             margin-right: 25px;
         }}
         #storage-health .health-label {{
-            color: #888;
+            color: var(--muted);
             margin-right: 5px;
         }}
-        #storage-health .status-good {{ color: #28a745; }}
-        #storage-health .status-warning {{ color: #ffc107; }}
-        #storage-health .status-critical {{ color: #dc3545; }}
+        #storage-health .status-good {{ color: var(--accent); }}
+        #storage-health .status-warning {{ color: var(--warn); }}
+        #storage-health .status-critical {{ color: var(--danger); }}
         header {{
-            background-color: #16213e;
+            background-color: var(--surface);
             padding: 15px 20px;
-            border-bottom: 2px solid #0f3460;
+            border-bottom: 2px solid var(--border);
             margin-bottom: 20px;
         }}
         header h1 {{
-            color: #00d9ff;
+            color: var(--accent-2);
             font-size: 1.5rem;
             font-weight: 600;
         }}
         .search-form {{
-            background-color: #16213e;
+            background-color: var(--surface);
             padding: 20px;
             border-radius: 8px;
             margin-bottom: 20px;
@@ -1075,21 +1099,21 @@ fn build_search_html(
             min-width: 300px;
         }}
         .form-group label {{
-            color: #888;
+            color: var(--muted);
             font-size: 0.85rem;
             font-weight: 500;
         }}
         input, select {{
-            background-color: #0f3460;
-            border: 1px solid #1a1a2e;
-            color: #eee;
+            background-color: var(--surface-alt);
+            border: 1px solid var(--border);
+            color: var(--text);
             padding: 10px 12px;
             border-radius: 4px;
             font-size: 0.95rem;
         }}
         input:focus, select:focus {{
             outline: none;
-            border-color: #00d9ff;
+            border-color: var(--accent-2);
         }}
         input[type="text"] {{
             width: 100%;
@@ -1098,8 +1122,8 @@ fn build_search_html(
             min-width: 150px;
         }}
         button {{
-            background-color: #00d9ff;
-            color: #1a1a2e;
+            background-color: var(--accent);
+            color: var(--bg);
             border: none;
             padding: 10px 25px;
             border-radius: 4px;
@@ -1109,7 +1133,7 @@ fn build_search_html(
             transition: background-color 0.2s;
         }}
         button:hover {{
-            background-color: #00b8d4;
+            background-color: var(--accent-2);
         }}
         .time-presets {{
             display: flex;
@@ -1117,9 +1141,9 @@ fn build_search_html(
             align-items: flex-end;
         }}
         .time-preset {{
-            background-color: #0f3460;
-            color: #00d9ff;
-            border: 1px solid #00d9ff;
+            background-color: var(--surface-alt);
+            color: var(--accent-2);
+            border: 1px solid var(--accent-2);
             padding: 8px 12px;
             border-radius: 4px;
             font-size: 0.85rem;
@@ -1127,14 +1151,14 @@ fn build_search_html(
             transition: all 0.2s;
         }}
         .time-preset:hover, .time-preset.active {{
-            background-color: #00d9ff;
-            color: #1a1a2e;
+            background-color: var(--accent-2);
+            color: var(--bg);
         }}
         .results-table-wrap {{
-            border: 1px solid #0f3460;
+            border: 1px solid var(--border);
             border-radius: 8px;
             overflow: hidden;
-            background-color: #16213e;
+            background-color: var(--surface);
         }}
         .results-table {{
             width: 100%;
@@ -1143,21 +1167,21 @@ fn build_search_html(
             table-layout: auto;
         }}
         .results-table th {{
-            background-color: #16213e;
+            background-color: var(--surface-alt);
             padding: 12px 10px;
             text-align: left;
             font-weight: 600;
-            color: #00d9ff;
-            border-bottom: 2px solid #0f3460;
+            color: var(--accent-2);
+            border-bottom: 2px solid var(--border);
         }}
         .results-table td {{
             padding: 10px;
-            border-bottom: 1px solid #0f3460;
-            vertical-align: top; 
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
             word-break: break-word;
         }}
         .results-table tr:hover {{
-            background-color: #16213e;
+            background-color: var(--surface-alt);
         }}
         .priority-critical {{
             background-color: rgba(255, 0, 0, 0.15);
@@ -1170,34 +1194,52 @@ fn build_search_html(
         }}
         .summary {{
             padding: 12px 16px;
-            background-color: #16213e;
-            border: 1px solid #00d9ff;
+            background-color: var(--surface);
+            border: 1px solid var(--accent-2);
             border-radius: 8px;
-            color: #b7e7f2;
+            color: var(--text);
             margin-bottom: 12px;
         }}
         .no-results {{
             text-align: center;
             padding: 40px;
-            color: #888;
+            color: var(--muted);
         }}
         .load-row {{
             text-align: center;
             padding: 14px;
         }}
         .load-row button {{
-            border: 1px solid #00d9ff;
+            border: 1px solid var(--accent-2);
             background: transparent;
-            color: #00d9ff;
+            color: var(--accent-2);
         }}
         .load-row button:hover {{
-            background: #00d9ff;
-            color: #1a1a2e;
+            background: var(--accent-2);
+            color: var(--bg);
         }}
         .keyboard-hint {{
-            color: #666;
+            color: var(--muted);
             font-size: 0.8rem;
             margin-left: 5px;
+        }}
+        .theme-toggle {{
+            position: fixed;
+            top: 10px;
+            right: 12px;
+            z-index: 1000;
+            border: 1px solid var(--accent-2);
+            background: var(--surface-alt);
+            color: var(--accent-2);
+            width: 36px;
+            height: 36px;
+            border-radius: 18px;
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            line-height: 1;
         }}
         @media (max-width: 768px) {{
             .search-row {{
@@ -1212,7 +1254,8 @@ fn build_search_html(
         }}
     </style>
 </head>
-<body>
+<body class="theme-dark">
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">&#9680;</button>
     <div class="global-header">
         <nav>
             <a href="/" target="_blank" class="active">Log Search</a>
@@ -1321,6 +1364,30 @@ fn build_search_html(
             document.querySelector('form').submit();
         }}
         window.setTimeRange = setTimeRange;
+
+        // Theme toggle (dark default)
+        (function() {{
+            const key = 'livedata-theme';
+            const body = document.body;
+            const btn = document.getElementById('theme-toggle');
+            const iconDark = '&#9680;';
+            const iconLight = '&#9681;';
+
+            function apply(theme) {{
+                body.classList.remove('theme-dark', 'theme-light');
+                body.classList.add(theme === 'light' ? 'theme-light' : 'theme-dark');
+                btn.innerHTML = theme === 'light' ? iconLight : iconDark;
+            }}
+
+            const saved = localStorage.getItem(key);
+            apply(saved === 'light' ? 'light' : 'dark');
+
+            btn.addEventListener('click', function() {{
+                const next = body.classList.contains('theme-dark') ? 'light' : 'dark';
+                localStorage.setItem(key, next);
+                apply(next);
+            }});
+        }})();
 
         // Storage health indicator
         (async function() {{
@@ -1483,30 +1550,60 @@ fn build_processes_html() -> String {
     <title>livedata - Process Monitor</title>
     <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1400px; margin: 0 auto; padding: 0; background-color: #f5f5f5; }
-        .global-header { background: white; border-bottom: 2px solid #007bff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        :root {
+            --bg: #272822;
+            --surface: #2d2e27;
+            --surface-alt: #3e3d32;
+            --text: #f8f8f2;
+            --muted: #a59f85;
+            --border: #49483e;
+            --accent: #a6e22e;
+            --accent-2: #66d9ef;
+            --warn: #fd971f;
+            --danger: #f92672;
+        }
+        body.theme-light {
+            --bg: #f8f8f2;
+            --surface: #efefe7;
+            --surface-alt: #ffffff;
+            --text: #272822;
+            --muted: #6f6b57;
+            --border: #b7b39e;
+            --accent: #3b7d15;
+            --accent-2: #0f8395;
+            --warn: #c15d00;
+            --danger: #c2175b;
+        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1400px; margin: 0 auto; padding: 0; background-color: var(--bg); color: var(--text); }
+        .global-header { background: var(--surface); border-bottom: 2px solid var(--accent); box-shadow: 0 2px 4px rgba(0,0,0,0.2); margin-bottom: 20px; }
         .global-header nav { display: flex; gap: 5px; padding: 15px 20px; max-width: 1400px; margin: 0 auto; }
-        .global-header nav a { color: #007bff; text-decoration: none; font-size: 16px; font-weight: 500; padding: 10px 18px; border-radius: 4px; }
-        .global-header nav a.active { background-color: #007bff; color: white; }
+        .global-header nav a { color: var(--accent-2); text-decoration: none; font-size: 16px; font-weight: 500; padding: 10px 18px; border-radius: 4px; }
+        .global-header nav a:hover { background: var(--surface-alt); }
+        .global-header nav a.active { background-color: var(--accent); color: var(--bg); }
         .container { padding: 0 20px 20px; }
         .controls { display: flex; gap: 12px; align-items: end; margin-bottom: 14px; flex-wrap: wrap; }
-        input, button { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
-        button { background-color: #007bff; color: white; border: none; cursor: pointer; }
-        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        th, td { padding: 10px; border-bottom: 1px solid #eee; text-align: left; }
-        th { background: #fafafa; }
-        .muted { color: #666; }
+        input, button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; font-size: 14px; }
+        input { background: var(--surface-alt); color: var(--text); }
+        button { background-color: var(--accent); color: var(--bg); border: none; cursor: pointer; }
+        button:hover { background: var(--accent-2); }
+        table { width: 100%; border-collapse: collapse; background: var(--surface); box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+        th, td { padding: 10px; border-bottom: 1px solid var(--border); text-align: left; }
+        th { background: var(--surface-alt); color: var(--accent-2); }
+        .muted { color: var(--muted); }
         .load-row { text-align: center; padding: 12px; }
-        .load-row button { background: white; color: #007bff; border: 1px solid #007bff; }
-        #storage-health { margin-bottom: 20px; padding: 15px 20px; background: white; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 14px; color: #555; }
+        .load-row button { background: var(--surface-alt); color: var(--accent-2); border: 1px solid var(--accent-2); }
+        .load-row button:hover { background: var(--accent-2); color: var(--bg); }
+        #storage-health { margin-bottom: 20px; padding: 15px 20px; background: var(--surface); border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); font-size: 14px; color: var(--text); border: 1px solid var(--border); }
         #storage-health .health-item { display: inline-block; margin-right: 25px; }
-        #storage-health .health-label { font-weight: 600; margin-right: 5px; }
-        #storage-health .status-good { color: #28a745; }
-        #storage-health .status-warning { color: #ffc107; }
-        #storage-health .status-critical { color: #dc3545; }
+        #storage-health .health-label { font-weight: 600; margin-right: 5px; color: var(--muted); }
+        #storage-health .status-good { color: var(--accent); }
+        #storage-health .status-warning { color: var(--warn); }
+        #storage-health .status-critical { color: var(--danger); }
+        .theme-toggle { position: fixed; top: 10px; right: 12px; z-index: 1000; border: 1px solid var(--accent-2); background: var(--surface-alt); color: var(--accent-2); width: 36px; height: 36px; border-radius: 18px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; line-height: 1; }
     </style>
 </head>
-<body>
+<body class="theme-dark">
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme">&#9680;</button>
     <div class="global-header">
         <nav>
             <a href="/" target="_blank">Log Search</a>
@@ -1554,6 +1651,29 @@ fn build_processes_html() -> String {
     </div>
 
     <script>
+        (function() {
+            const key = 'livedata-theme';
+            const body = document.body;
+            const btn = document.getElementById('theme-toggle');
+            const iconDark = '&#9680;';
+            const iconLight = '&#9681;';
+
+            function apply(theme) {
+                body.classList.remove('theme-dark', 'theme-light');
+                body.classList.add(theme === 'light' ? 'theme-light' : 'theme-dark');
+                btn.innerHTML = theme === 'light' ? iconLight : iconDark;
+            }
+
+            const saved = localStorage.getItem(key);
+            apply(saved === 'light' ? 'light' : 'dark');
+
+            btn.addEventListener('click', function() {
+                const next = body.classList.contains('theme-dark') ? 'light' : 'dark';
+                localStorage.setItem(key, next);
+                apply(next);
+            });
+        })();
+
         (async function() {
             async function updateStorageHealth() {
                 try {
