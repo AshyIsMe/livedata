@@ -79,6 +79,28 @@ pub struct SearchParams {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TimechartParams {
+    /// Text search (MESSAGE field, case-insensitive ILIKE)
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Start time (ISO 8601 or relative: -1h, -15m, -7d)
+    #[serde(default = "default_start")]
+    pub start: String,
+    /// End time (ISO 8601 or "now")
+    #[serde(default = "default_end")]
+    pub end: String,
+    /// Filter by hostname (comma-separated)
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Filter by systemd unit (comma-separated)
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Max priority level (0-7, lower = more severe)
+    #[serde(default)]
+    pub priority: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ProcessTableParams {
     #[serde(default)]
     pub q: Option<String>,
@@ -133,6 +155,14 @@ pub struct SearchResponse {
     pub limit: usize,
     pub offset: usize,
     pub query_time_ms: u128,
+}
+
+/// Timechart bin response row
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TimechartBin {
+    pub time_bin: String,
+    pub level: String,
+    pub count: i64,
 }
 
 /// Column info for /api/columns endpoint
@@ -292,6 +322,20 @@ fn priority_label(p: u8) -> &'static str {
     }
 }
 
+fn priority_level_name(p: i32) -> &'static str {
+    match p {
+        0 => "Emergency",
+        1 => "Alert",
+        2 => "Critical",
+        3 => "Error",
+        4 => "Warning",
+        5 => "Notice",
+        6 => "Info",
+        7 => "Debug",
+        _ => "Unknown",
+    }
+}
+
 pub async fn run_web_server(
     data_dir: &str,
     buffer: Arc<Mutex<DuckDBBuffer>>,
@@ -306,6 +350,7 @@ pub async fn run_web_server(
         .route("/", get(search_ui))
         .route("/htmx/logs/chunk", get(htmx_logs_chunk))
         .route("/api/search", get(api_search))
+        .route("/api/timechart", get(api_timechart))
         .route("/api/columns", get(api_columns))
         .route("/api/filters", get(api_filters))
         .route("/api/processes", get(api_processes))
@@ -846,6 +891,104 @@ async fn api_search(
     }))
 }
 
+/// API timechart endpoint returning 1-minute bins grouped by log level
+async fn api_timechart(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TimechartParams>,
+) -> Result<Json<Vec<TimechartBin>>, (StatusCode, String)> {
+    let now = Utc::now();
+    let start = parse_time(&params.start, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let end = parse_time(&params.end, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let schema = get_schema_columns(&state.buffer);
+    if schema.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let mut where_sql = format!(
+        "timestamp >= '{}' AND timestamp < '{}'",
+        start.to_rfc3339(),
+        end.to_rfc3339()
+    );
+
+    if let Some(ref q) = params.q
+        && !q.is_empty()
+    {
+        let escaped = escape_like(q);
+        where_sql.push_str(&format!(" AND message ILIKE '%{}%' ESCAPE '\\'", escaped));
+    }
+    if let Some(ref hostname) = params.hostname
+        && !hostname.is_empty()
+    {
+        let hosts: Vec<&str> = hostname.split(',').collect();
+        let host_list: Vec<String> = hosts
+            .iter()
+            .map(|h| format!("'{}'", h.replace('\'', "''")))
+            .collect();
+        where_sql.push_str(&format!(" AND _hostname IN ({})", host_list.join(",")));
+    }
+    if let Some(ref unit) = params.unit
+        && !unit.is_empty()
+    {
+        let units: Vec<&str> = unit.split(',').collect();
+        let unit_list: Vec<String> = units
+            .iter()
+            .map(|u| format!("'{}'", u.replace('\'', "''")))
+            .collect();
+        where_sql.push_str(&format!(" AND _systemd_unit IN ({})", unit_list.join(",")));
+    }
+    if let Some(priority) = params.priority {
+        where_sql.push_str(&format!(" AND CAST(priority AS INTEGER) <= {}", priority));
+    }
+
+    let sql = format!(
+        "SELECT CAST(to_timestamp(floor(epoch(timestamp) / 60) * 60) AS VARCHAR) AS time_bin,
+                COALESCE(TRY_CAST(priority AS INTEGER), 6) AS priority,
+                COUNT(*) AS count
+         FROM journal_logs
+         WHERE {}
+         GROUP BY 1, 2
+         ORDER BY 1 ASC, 2 ASC",
+        where_sql
+    );
+
+    let display_names = vec![
+        "time_bin".to_string(),
+        "priority".to_string(),
+        "count".to_string(),
+    ];
+    let rows = state
+        .buffer
+        .lock()
+        .unwrap()
+        .query_json_rows(&sql, &display_names)
+        .unwrap_or_default();
+
+    let bins = rows
+        .into_iter()
+        .filter_map(|row| {
+            let obj = row.as_object()?;
+            let time_bin = obj.get("time_bin")?.as_str()?.to_string();
+            let priority = obj.get("priority").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            })?;
+            let count = obj.get("count").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            })?;
+
+            Some(TimechartBin {
+                time_bin,
+                level: priority_level_name(priority as i32).to_string(),
+                count,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(bins))
+}
+
 /// API filters endpoint returning available filter values
 async fn api_filters(
     State(state): State<Arc<AppState>>,
@@ -977,6 +1120,7 @@ fn build_search_html(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Livedata - Log Search</title>
     <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
     <style>
         :root {{
             --bg: #272822;
@@ -1153,6 +1297,38 @@ fn build_search_html(
         .time-preset:hover, .time-preset.active {{
             background-color: var(--accent-2);
             color: var(--bg);
+        }}
+        .timechart-panel {{
+            background-color: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 16px 10px;
+            margin-bottom: 12px;
+        }}
+        .timechart-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 8px;
+        }}
+        .timechart-title {{
+            color: var(--accent-2);
+            font-size: 0.95rem;
+            font-weight: 600;
+        }}
+        .timechart-subtitle {{
+            color: var(--muted);
+            font-size: 0.8rem;
+        }}
+        #timechart {{
+            width: 100%;
+            min-height: 260px;
+        }}
+        .timechart-empty {{
+            color: var(--muted);
+            text-align: center;
+            padding: 40px 0;
+            font-size: 0.9rem;
         }}
         .results-table-wrap {{
             border: 1px solid var(--border);
@@ -1332,6 +1508,14 @@ fn build_search_html(
             <input type="hidden" name="columns" value="{}">
         </form>
 
+        <section class="timechart-panel" aria-label="Log level timechart">
+            <div class="timechart-header">
+                <div class="timechart-title">Timechart</div>
+                <div class="timechart-subtitle">1-minute bins by log level</div>
+            </div>
+            <div id="timechart"></div>
+        </section>
+
         <div class="summary">
             Showing {} loaded rows out of {} total
         </div>
@@ -1365,6 +1549,165 @@ fn build_search_html(
         }}
         window.setTimeRange = setTimeRange;
 
+        const TIMECHART_LEVELS = ['Emergency', 'Alert', 'Critical', 'Error', 'Warning', 'Notice', 'Info', 'Debug'];
+        const TIMECHART_COLORS = {{
+            Emergency: '#7f0000',
+            Alert: '#b10026',
+            Critical: '#d7301f',
+            Error: '#ef6548',
+            Warning: '#fc8d59',
+            Notice: '#fdbb84',
+            Info: '#74add1',
+            Debug: '#4575b4'
+        }};
+        let cachedTimechartData = [];
+
+        function getTimechartQueryParams() {{
+            const form = document.querySelector('.search-form');
+            const formData = new FormData(form);
+            const params = new URLSearchParams();
+            ['q', 'start', 'end', 'hostname', 'unit', 'priority'].forEach((key) => {{
+                const value = String(formData.get(key) || '').trim();
+                if (value !== '') params.set(key, value);
+            }});
+            return params;
+        }}
+
+        async function loadTimechart() {{
+            const chartEl = document.getElementById('timechart');
+            if (typeof d3 === 'undefined') {{
+                chartEl.innerHTML = '<div class="timechart-empty">Failed to load D3</div>';
+                return;
+            }}
+
+            chartEl.innerHTML = '<div class="timechart-empty">Loading timechart...</div>';
+            try {{
+                const params = getTimechartQueryParams();
+                const response = await fetch(`/api/timechart?${{params.toString()}}`);
+                if (!response.ok) throw new Error('Failed to fetch timechart data');
+                const rows = await response.json();
+                cachedTimechartData = rows;
+                renderTimechart(rows);
+            }} catch (error) {{
+                console.error('Failed to load timechart:', error);
+                chartEl.innerHTML = '<div class="timechart-empty">Unable to load timechart</div>';
+            }}
+        }}
+
+        function renderTimechart(rows) {{
+            const chartEl = document.getElementById('timechart');
+            chartEl.innerHTML = '';
+
+            if (!Array.isArray(rows) || rows.length === 0) {{
+                chartEl.innerHTML = '<div class="timechart-empty">No matching log events for this range</div>';
+                return;
+            }}
+
+            const binsByTime = new Map();
+            rows.forEach((row) => {{
+                const ts = new Date(row.time_bin);
+                if (Number.isNaN(ts.getTime())) return;
+                const key = ts.toISOString();
+                if (!binsByTime.has(key)) {{
+                    const seeded = {{ time: ts }};
+                    TIMECHART_LEVELS.forEach((level) => {{
+                        seeded[level] = 0;
+                    }});
+                    binsByTime.set(key, seeded);
+                }}
+                const bin = binsByTime.get(key);
+                const level = TIMECHART_LEVELS.includes(row.level) ? row.level : 'Info';
+                const count = Number(row.count) || 0;
+                bin[level] += count;
+            }});
+
+            const data = Array.from(binsByTime.values()).sort((a, b) => a.time - b.time);
+            if (data.length === 0) {{
+                chartEl.innerHTML = '<div class="timechart-empty">No matching log events for this range</div>';
+                return;
+            }}
+
+            const styles = getComputedStyle(document.body);
+            const textColor = styles.getPropertyValue('--text').trim();
+            const borderColor = styles.getPropertyValue('--border').trim();
+            const width = Math.max(chartEl.clientWidth, 320);
+            const height = 280;
+            const margin = {{ top: 12, right: 10, bottom: 38, left: 50 }};
+
+            const x = d3.scaleBand()
+                .domain(data.map((d) => d.time))
+                .range([margin.left, width - margin.right])
+                .paddingInner(0.1);
+
+            const yMax = d3.max(data, (d) => d3.sum(TIMECHART_LEVELS, (k) => d[k])) || 0;
+            const y = d3.scaleLinear()
+                .domain([0, yMax > 0 ? yMax : 1])
+                .nice()
+                .range([height - margin.bottom, margin.top]);
+
+            const stack = d3.stack().keys(TIMECHART_LEVELS);
+            const series = stack(data);
+
+            const svg = d3.create('svg')
+                .attr('viewBox', `0 0 ${{width}} ${{height}}`)
+                .attr('width', width)
+                .attr('height', height)
+                .attr('role', 'img')
+                .attr('aria-label', 'Stacked bar chart of log counts by level and 1-minute time bin');
+
+            svg.append('g')
+                .attr('stroke', borderColor)
+                .attr('stroke-opacity', 0.6)
+                .selectAll('line')
+                .data(y.ticks(4))
+                .join('line')
+                .attr('x1', margin.left)
+                .attr('x2', width - margin.right)
+                .attr('y1', (d) => y(d))
+                .attr('y2', (d) => y(d));
+
+            const levelGroups = svg.append('g')
+                .selectAll('g')
+                .data(series)
+                .join('g')
+                .attr('fill', (d) => TIMECHART_COLORS[d.key] || TIMECHART_COLORS.Info);
+
+            levelGroups.selectAll('rect')
+                .data((d) => d.map((v) => Object.assign(v, {{ level: d.key }})))
+                .join('rect')
+                .attr('x', (d) => x(d.data.time) || 0)
+                .attr('y', (d) => y(d[1]))
+                .attr('height', (d) => Math.max(0, y(d[0]) - y(d[1])))
+                .attr('width', x.bandwidth())
+                .append('title')
+                .text((d) => `${{d.level}}: ${{d.data[d.level]}} @ ${{d3.timeFormat('%Y-%m-%d %H:%M')(d.data.time)}}`);
+
+            const tickEvery = Math.max(1, Math.ceil(data.length / 12));
+            svg.append('g')
+                .attr('transform', `translate(0,${{height - margin.bottom}})`)
+                .call(
+                    d3.axisBottom(x)
+                        .tickValues(data.filter((_, i) => i % tickEvery === 0).map((d) => d.time))
+                        .tickFormat(d3.timeFormat('%H:%M'))
+                )
+                .call((g) => g.selectAll('text').attr('fill', textColor))
+                .call((g) => g.selectAll('line,path').attr('stroke', borderColor));
+
+            svg.append('g')
+                .attr('transform', `translate(${{margin.left}},0)`)
+                .call(d3.axisLeft(y).ticks(4).tickFormat(d3.format('d')))
+                .call((g) => g.selectAll('text').attr('fill', textColor))
+                .call((g) => g.selectAll('line,path').attr('stroke', borderColor));
+
+            chartEl.append(svg.node());
+        }}
+
+        window.addEventListener('resize', () => {{
+            if (cachedTimechartData.length > 0) renderTimechart(cachedTimechartData);
+        }});
+
+        loadTimechart();
+
         // Theme toggle (dark default)
         (function() {{
             const key = 'livedata-theme';
@@ -1386,6 +1729,7 @@ fn build_search_html(
                 const next = body.classList.contains('theme-dark') ? 'light' : 'dark';
                 localStorage.setItem(key, next);
                 apply(next);
+                if (cachedTimechartData.length > 0) renderTimechart(cachedTimechartData);
             }});
         }})();
 
