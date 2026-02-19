@@ -177,19 +177,6 @@ impl JournalLogReader {
         match self.journal.next_entry() {
             Ok(Some(entry)) => {
                 let log_entry = self.convert_journal_entry(&entry)?;
-
-                // Print all fields on a single line for real-time processing
-                let fields_vec: Vec<String> = log_entry
-                    .fields
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
-                    .collect();
-                info!(
-                    "Real-time Entry {} {}",
-                    log_entry.timestamp,
-                    fields_vec.join(" ")
-                );
-
                 Ok(Some(log_entry))
             }
             Ok(None) => Ok(None),

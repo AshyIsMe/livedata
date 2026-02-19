@@ -8,12 +8,17 @@ use chrono::{TimeDelta, Utc};
 use gethostname::gethostname;
 use log::{error, info, warn};
 use signal_hook::consts::SIGINT;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+#[derive(Default)]
+struct IngestCounters {
+    journal_records_ingested: AtomicU64,
+    process_metrics_collected: AtomicU64,
+}
 
 pub struct ApplicationController {
     journal_reader: JournalLogReader,
@@ -21,6 +26,7 @@ pub struct ApplicationController {
     hostname: String,
     shutdown_signal: Arc<AtomicBool>,
     process_monitor: Arc<ProcessMonitor>,
+    ingest_counters: Arc<IngestCounters>,
     process_monitor_handle: Option<thread::JoinHandle<()>>,
     metrics_receiver_handle: Option<thread::JoinHandle<()>>,
 }
@@ -70,6 +76,8 @@ impl ApplicationController {
         );
 
         let shared_buffer = buffer.clone();
+        let ingest_counters = Arc::new(IngestCounters::default());
+        let counters_for_metrics = ingest_counters.clone();
 
         // Spawn dedicated receiver task in a thread to persist process metrics
         let metrics_receiver_handle = thread::spawn(move || {
@@ -81,11 +89,6 @@ impl ApplicationController {
 
                 while let Some(batch) = metrics_rx.recv().await {
                     let process_count = batch.processes.len();
-                    info!(
-                        "Received process metrics batch with {} processes",
-                        process_count
-                    );
-
                     if batch.processes.is_empty() {
                         continue;
                     }
@@ -98,7 +101,9 @@ impl ApplicationController {
                     if let Err(e) = result {
                         error!("Failed to persist process metrics: {}", e);
                     } else {
-                        info!("Successfully persisted {} process metrics", process_count);
+                        counters_for_metrics
+                            .process_metrics_collected
+                            .fetch_add(process_count as u64, Ordering::Relaxed);
                     }
                 }
 
@@ -122,6 +127,7 @@ impl ApplicationController {
             hostname,
             shutdown_signal,
             process_monitor,
+            ingest_counters,
             process_monitor_handle: Some(process_monitor_handle),
             metrics_receiver_handle: Some(metrics_receiver_handle),
         })
@@ -180,8 +186,8 @@ impl ApplicationController {
             info!("Follow mode: starting real-time monitoring from now");
         }
 
-        let mut last_status_time = Utc::now();
-        let status_interval = TimeDelta::seconds(30); // Log status every 30 seconds
+        let mut last_summary_time = Utc::now();
+        let summary_interval = TimeDelta::minutes(5);
 
         info!("Starting main loop");
 
@@ -199,11 +205,11 @@ impl ApplicationController {
                 }
             }
 
-            // Log status periodically
+            // Log periodic ingestion summary
             let current_time = Utc::now();
-            if current_time - last_status_time >= status_interval {
-                self.log_status();
-                last_status_time = current_time;
+            if current_time - last_summary_time >= summary_interval {
+                self.log_ingest_summary();
+                last_summary_time = current_time;
             }
 
             // Small sleep to prevent busy waiting
@@ -256,7 +262,26 @@ impl ApplicationController {
     fn process_log_entry(&mut self, entry: LogEntry) -> Result<()> {
         // Add entry to on-disk DuckDB
         self.buffer.lock().unwrap().add_entry(&entry)?;
+        self.ingest_counters
+            .journal_records_ingested
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn log_ingest_summary(&self) {
+        let journal_records = self
+            .ingest_counters
+            .journal_records_ingested
+            .swap(0, Ordering::Relaxed);
+        let process_metrics = self
+            .ingest_counters
+            .process_metrics_collected
+            .swap(0, Ordering::Relaxed);
+
+        info!(
+            "Ingest summary (last 5m): {} journal records ingested, {} process metrics collected",
+            journal_records, process_metrics
+        );
     }
 
     fn graceful_shutdown(&mut self, checkpoint_on_shutdown: bool) -> Result<()> {
@@ -294,31 +319,6 @@ impl ApplicationController {
     pub fn checkpoint_database(&mut self) {
         if let Err(e) = self.buffer.lock().unwrap().checkpoint() {
             warn!("Failed to checkpoint database during shutdown: {}", e);
-        }
-    }
-
-    fn log_status(&mut self) {
-        let mut buffer = self.buffer.lock().unwrap();
-        match buffer.get_buffer_stats() {
-            Ok(stats) => {
-                info!(
-                    "Status: {} total entries in DuckDB, {} distinct minutes",
-                    stats.total_entries, stats.buffered_minutes_count
-                );
-
-                if let (Some(oldest), Some(newest)) = (&stats.oldest_minute, &stats.newest_minute) {
-                    info!("Data range: {} to {}", oldest, newest);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to get database status: {}", e);
-            }
-        }
-
-        // Log database file size
-        if let Ok(metadata) = std::fs::metadata(buffer.db_path()) {
-            let size_mb = metadata.len() / (1024 * 1024);
-            info!("Database size: {} MB", size_mb);
         }
     }
 
