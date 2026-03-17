@@ -21,6 +21,17 @@ pub struct ProcessInfo {
     pub parent_pid: Option<u32>,
 }
 
+impl ProcessInfo {
+    /// Join cmd args into a single string, or None if empty.
+    pub fn cmdline(&self) -> Option<String> {
+        if self.cmd.is_empty() {
+            None
+        } else {
+            Some(self.cmd.join(" "))
+        }
+    }
+}
+
 /// Batch of process metrics with timestamp
 #[derive(Debug, Clone)]
 pub struct ProcessMetricsBatch {

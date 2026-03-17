@@ -486,23 +486,19 @@ fn get_current_process_rows(
                     .map(|s| s.to_string())
             });
 
-            let cmdline = if process.cmd.is_empty() {
-                None
-            } else {
-                Some(process.cmd.join(" "))
-            };
+            let cmdline = process.cmdline();
 
             ProcessMetricsRow {
                 timestamp: timestamp.clone(),
                 pid: process.pid,
-                name: process.name.clone(),
+                name: process.name,
                 cpu_usage: process.cpu_percent,
                 mem_usage: process.memory_bytes as f64,
                 user,
                 runtime: process.runtime_secs,
                 cmdline,
                 virtual_memory: process.virtual_memory_bytes as f64,
-                status: Some(process.status.clone()),
+                status: Some(process.status),
                 parent_pid: process.parent_pid,
             }
         })

@@ -1024,11 +1024,7 @@ impl DuckDBBuffer {
                     .map(|s| s.to_string())
             });
 
-            let cmdline = if process.cmd.is_empty() {
-                None
-            } else {
-                Some(process.cmd.join(" "))
-            };
+            let cmdline = process.cmdline();
             let parent_pid = process.parent_pid.map(|p| p as i32);
 
             appender.append_row(params![
