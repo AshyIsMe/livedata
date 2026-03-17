@@ -1431,6 +1431,45 @@ fn build_search_html(
             font-size: 18px;
             line-height: 1;
         }}
+        .column-chooser {{
+            background-color: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 12px;
+        }}
+        .column-chooser summary {{
+            cursor: pointer;
+            padding: 10px 16px;
+            color: var(--accent-2);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }}
+        .column-chooser summary:hover {{
+            background-color: var(--surface-alt);
+            border-radius: 8px;
+        }}
+        .column-chooser-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 4px 12px;
+            padding: 8px 16px 12px;
+        }}
+        .column-chooser-grid label {{
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.85rem;
+            color: var(--text);
+            cursor: pointer;
+            padding: 3px 0;
+        }}
+        .column-chooser-grid input[type="checkbox"] {{
+            accent-color: var(--accent);
+        }}
+        .column-chooser-grid .col-type {{
+            color: var(--muted);
+            font-size: 0.75rem;
+        }}
         @media (max-width: 768px) {{
             .search-row {{
                 flex-direction: column;
@@ -1521,6 +1560,11 @@ fn build_search_html(
             <input type="hidden" name="offset" value="0">
             <input type="hidden" name="columns" value="{}">
         </form>
+
+        <details class="column-chooser" id="column-chooser">
+            <summary>Columns</summary>
+            <div class="column-chooser-grid" id="column-checkboxes">Loading columns...</div>
+        </details>
 
         <section class="timechart-panel" aria-label="Log level timechart">
             <div class="timechart-header">
@@ -1786,6 +1830,84 @@ fn build_search_html(
 
             // Refresh every 30 seconds
             setInterval(updateStorageHealth, 30000);
+        }})();
+
+        // Column chooser
+        (async function() {{
+            const STORAGE_KEY = 'livedata-columns';
+            const columnsInput = document.querySelector('input[name="columns"]');
+            const grid = document.getElementById('column-checkboxes');
+
+            // Load saved selection from localStorage (or use current columns param)
+            let savedCols = null;
+            try {{
+                const stored = localStorage.getItem(STORAGE_KEY);
+                if (stored) savedCols = JSON.parse(stored);
+            }} catch(_) {{}}
+
+            // If columns were passed in the URL, use those instead
+            const urlCols = columnsInput.value.trim();
+            if (urlCols) {{
+                savedCols = urlCols.split(',').map(s => s.trim()).filter(Boolean);
+            }}
+
+            try {{
+                const response = await fetch('/api/columns');
+                if (!response.ok) throw new Error('Failed to fetch columns');
+                const columns = await response.json();
+
+                // Determine which columns are checked
+                const activeSet = savedCols
+                    ? new Set(savedCols)
+                    : new Set(columns.filter(c => c.default).map(c => c.name));
+
+                grid.innerHTML = '';
+                columns.forEach(col => {{
+                    const label = document.createElement('label');
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.value = col.name;
+                    cb.checked = activeSet.has(col.name);
+                    cb.addEventListener('change', onColumnChange);
+
+                    const nameSpan = document.createElement('span');
+                    nameSpan.textContent = col.name;
+
+                    const typeSpan = document.createElement('span');
+                    typeSpan.className = 'col-type';
+                    typeSpan.textContent = col.column_type;
+
+                    label.appendChild(cb);
+                    label.appendChild(nameSpan);
+                    label.appendChild(typeSpan);
+                    grid.appendChild(label);
+                }});
+
+                // Sync hidden input with current selection
+                syncColumns();
+            }} catch (error) {{
+                console.error('Failed to load columns:', error);
+                grid.textContent = 'Failed to load columns';
+            }}
+
+            function getSelectedColumns() {{
+                return Array.from(grid.querySelectorAll('input[type="checkbox"]:checked'))
+                    .map(cb => cb.value);
+            }}
+
+            function syncColumns() {{
+                const selected = getSelectedColumns();
+                columnsInput.value = selected.join(',');
+                try {{
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(selected));
+                }} catch(_) {{}}
+            }}
+
+            function onColumnChange() {{
+                syncColumns();
+                // Re-submit the search form to apply column changes
+                document.querySelector('form.search-form').submit();
+            }}
         }})();
     </script>
 </body>
