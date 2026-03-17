@@ -25,6 +25,10 @@ pub struct Settings {
     /// Path to the config file
     #[serde(skip)]
     pub config_file: PathBuf,
+
+    /// Maximum database size for backfill (set via --max-db-size CLI arg)
+    #[serde(skip)]
+    pub max_db_size_bytes: Option<u64>,
 }
 
 fn default_cleanup_interval() -> u32 {
@@ -40,8 +44,27 @@ impl Default for Settings {
             process_max_size_gb: 0.5,
             cleanup_interval_minutes: 10,
             config_file: Self::default_config_path(),
+            max_db_size_bytes: None,
         }
     }
+}
+
+/// Parse human-friendly size strings like "5G", "500M", "1T", "1024K", "1024"
+pub fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('T') {
+        (n, 1_099_511_627_776u64)
+    } else if let Some(n) = s.strip_suffix('G') {
+        (n, 1_073_741_824u64)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1_048_576u64)
+    } else if let Some(n) = s.strip_suffix('K') {
+        (n, 1_024u64)
+    } else {
+        (s, 1u64)
+    };
+    let num: f64 = num_str.parse().context("Invalid size number")?;
+    Ok((num * multiplier as f64) as u64)
 }
 
 impl Settings {
@@ -224,5 +247,20 @@ mod tests {
         // Test within range
         let settings = Settings::load_with_cli_args(None, None, None, None, Some(10)).unwrap();
         assert_eq!(settings.cleanup_interval_minutes, 10);
+    }
+
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(parse_size("5G").unwrap(), 5 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("500M").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(parse_size("1T").unwrap(), 1024 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1024K").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_parse_size_invalid() {
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("G").is_err());
     }
 }

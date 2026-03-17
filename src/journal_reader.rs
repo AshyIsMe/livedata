@@ -172,6 +172,20 @@ impl JournalLogReader {
         }
     }
 
+    pub fn previous_entry(&mut self) -> Result<Option<LogEntry>> {
+        match self.journal.previous_entry() {
+            Ok(Some(entry)) => {
+                let log_entry = self.convert_journal_entry(&entry)?;
+                Ok(Some(log_entry))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                info!("Error reading previous journal entry: {}", e);
+                Ok(None)
+            }
+        }
+    }
+
     pub fn next_log_entry(&mut self) -> Result<Option<LogEntry>> {
         // Check for entries and return them
         match self.journal.next_entry() {

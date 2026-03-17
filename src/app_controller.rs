@@ -29,6 +29,8 @@ pub struct ApplicationController {
     ingest_counters: Arc<IngestCounters>,
     process_monitor_handle: Option<thread::JoinHandle<()>>,
     metrics_receiver_handle: Option<thread::JoinHandle<()>>,
+    backfill_handle: Option<thread::JoinHandle<()>>,
+    max_db_size_bytes: Option<u64>,
 }
 
 impl ApplicationController {
@@ -130,6 +132,8 @@ impl ApplicationController {
             ingest_counters,
             process_monitor_handle: Some(process_monitor_handle),
             metrics_receiver_handle: Some(metrics_receiver_handle),
+            backfill_handle: None,
+            max_db_size_bytes: settings.max_db_size_bytes,
         })
     }
 
@@ -186,6 +190,11 @@ impl ApplicationController {
             info!("Follow mode: starting real-time monitoring from now");
         }
 
+        // Spawn backfill thread if max_db_size is configured
+        if let Some(max_bytes) = self.max_db_size_bytes {
+            self.spawn_backfill_thread(max_bytes);
+        }
+
         let mut last_summary_time = Utc::now();
         let summary_interval = TimeDelta::minutes(5);
 
@@ -218,6 +227,114 @@ impl ApplicationController {
 
         // Graceful shutdown
         self.graceful_shutdown(checkpoint_on_shutdown)
+    }
+
+    fn spawn_backfill_thread(&mut self, max_db_size_bytes: u64) {
+        let buffer = self.buffer.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
+
+        let handle = thread::spawn(move || {
+            info!(
+                "Backfill thread starting: scanning journal backward until DB reaches {} bytes",
+                max_db_size_bytes
+            );
+
+            let mut reader = match JournalLogReader::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Backfill: failed to open journal reader: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = reader.seek_to_tail() {
+                error!("Backfill: failed to seek to tail: {}", e);
+                return;
+            }
+
+            let mut total_backfilled: u64 = 0;
+
+            loop {
+                if shutdown_signal.load(Ordering::Relaxed) {
+                    info!("Backfill thread: shutdown signal received, stopping");
+                    break;
+                }
+
+                // Process a batch of 1000 entries
+                let mut batch_count = 0;
+                let mut hit_end = false;
+
+                {
+                    let mut buf = buffer.lock().unwrap();
+                    if let Err(e) = buf.begin_transaction() {
+                        error!("Backfill: failed to begin transaction: {}", e);
+                        break;
+                    }
+
+                    for _ in 0..1000 {
+                        match reader.previous_entry() {
+                            Ok(Some(entry)) => {
+                                if let Err(e) = buf.add_entry(&entry) {
+                                    error!("Backfill: failed to add entry: {}", e);
+                                }
+                                batch_count += 1;
+                            }
+                            Ok(None) => {
+                                hit_end = true;
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Backfill: error reading entry: {}", e);
+                                hit_end = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Err(e) = buf.commit_transaction() {
+                        error!("Backfill: failed to commit transaction: {}", e);
+                        break;
+                    }
+                }
+
+                total_backfilled += batch_count;
+
+                if hit_end {
+                    info!(
+                        "Backfill complete: reached beginning of journal after {} entries",
+                        total_backfilled
+                    );
+                    break;
+                }
+
+                // Check DB file size
+                let db_size = {
+                    let buf = buffer.lock().unwrap();
+                    std::fs::metadata(buf.db_path())
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                };
+
+                if db_size >= max_db_size_bytes {
+                    info!(
+                        "Backfill complete: DB size {} bytes >= max {} bytes after {} entries",
+                        db_size, max_db_size_bytes, total_backfilled
+                    );
+                    break;
+                }
+
+                // Yield to live ingestion
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            info!(
+                "Backfill thread exiting, total entries backfilled: {}",
+                total_backfilled
+            );
+        });
+
+        self.backfill_handle = Some(handle);
+        info!("Backfill thread spawned");
     }
 
     fn process_startup_historical_data(&mut self) -> Result<()> {
@@ -291,15 +408,22 @@ impl ApplicationController {
 
         self.process_monitor.shutdown_metrics_channel();
 
-        if let Some(handle) = self.process_monitor_handle.take() {
-            if let Err(e) = handle.join() {
-                warn!("Failed to join process monitor thread: {:?}", e);
-            }
+        if let Some(handle) = self.process_monitor_handle.take()
+            && let Err(e) = handle.join()
+        {
+            warn!("Failed to join process monitor thread: {:?}", e);
         }
 
-        if let Some(handle) = self.metrics_receiver_handle.take() {
+        if let Some(handle) = self.metrics_receiver_handle.take()
+            && let Err(e) = handle.join()
+        {
+            warn!("Failed to join metrics receiver thread: {:?}", e);
+        }
+
+        if let Some(handle) = self.backfill_handle.take() {
+            info!("Waiting for backfill thread to finish");
             if let Err(e) = handle.join() {
-                warn!("Failed to join metrics receiver thread: {:?}", e);
+                warn!("Failed to join backfill thread: {:?}", e);
             }
         }
 

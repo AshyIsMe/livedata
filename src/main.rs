@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use livedata::app_controller::ApplicationController;
-use livedata::config::Settings;
+use livedata::config::{Settings, parse_size};
 use livedata::web_server::run_web_server;
 use std::thread;
 use tracing::info;
@@ -44,6 +44,10 @@ struct Args {
     #[arg(long)]
     cleanup_interval: Option<u32>,
 
+    /// Maximum database size for backfill (e.g., 5G, 500M). Enables historical journal scanning.
+    #[arg(long)]
+    max_db_size: Option<String>,
+
     /// Write plaintext SQL trace to data_dir/trace.sql
     #[arg(long)]
     sql_trace: bool,
@@ -79,13 +83,20 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load configuration with CLI overrides
-    let settings = Settings::load_with_cli_args(
+    let mut settings = Settings::load_with_cli_args(
         args.log_retention_days,
         args.log_max_size_gb,
         args.process_retention_days,
         args.process_max_size_gb,
         args.cleanup_interval,
     )?;
+
+    // Parse and set max_db_size if provided
+    if let Some(ref size_str) = args.max_db_size {
+        let max_bytes = parse_size(size_str)?;
+        settings.max_db_size_bytes = Some(max_bytes);
+        info!("Backfill enabled: max DB size = {} bytes", max_bytes);
+    }
 
     info!("Configuration loaded:");
     info!("  Log retention: {} days", settings.log_retention_days);

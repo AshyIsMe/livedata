@@ -598,10 +598,9 @@ async fn htmx_processes_chunk(
     .into_response()
 }
 
-fn query_log_results(
-    state: &Arc<AppState>,
-    params: &SearchParams,
-) -> Result<(Vec<serde_json::Value>, Vec<String>, usize), (StatusCode, String)> {
+type LogQueryResult = Result<(Vec<serde_json::Value>, Vec<String>, usize), (StatusCode, String)>;
+
+fn query_log_results(state: &Arc<AppState>, params: &SearchParams) -> LogQueryResult {
     let now = Utc::now();
     let start = parse_time(&params.start, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let end = parse_time(&params.end, now).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
