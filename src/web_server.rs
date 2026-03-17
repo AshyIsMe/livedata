@@ -226,6 +226,10 @@ pub struct ProcessMetricsRow {
     pub mem_usage: f64,
     pub user: Option<String>,
     pub runtime: u64,
+    pub cmdline: Option<String>,
+    pub virtual_memory: f64,
+    pub status: Option<String>,
+    pub parent_pid: Option<u32>,
 }
 
 fn to_process_row(r: ProcessMetricRecord) -> ProcessMetricsRow {
@@ -237,6 +241,10 @@ fn to_process_row(r: ProcessMetricRecord) -> ProcessMetricsRow {
         mem_usage: r.mem_usage,
         user: r.user,
         runtime: r.runtime,
+        cmdline: r.cmdline,
+        virtual_memory: r.virtual_memory,
+        status: r.status,
+        parent_pid: r.parent_pid,
     }
 }
 
@@ -478,14 +486,24 @@ fn get_current_process_rows(
                     .map(|s| s.to_string())
             });
 
+            let cmdline = if process.cmd.is_empty() {
+                None
+            } else {
+                Some(process.cmd.join(" "))
+            };
+
             ProcessMetricsRow {
                 timestamp: timestamp.clone(),
                 pid: process.pid,
-                name: process.name,
+                name: process.name.clone(),
                 cpu_usage: process.cpu_percent,
                 mem_usage: process.memory_bytes as f64,
                 user,
                 runtime: process.runtime_secs,
+                cmdline,
+                virtual_memory: process.virtual_memory_bytes as f64,
+                status: Some(process.status.clone()),
+                parent_pid: process.parent_pid,
             }
         })
         .collect();
@@ -1983,11 +2001,15 @@ fn build_processes_html() -> String {
                 <tr>
                     <th>Timestamp</th>
                     <th>PID</th>
+                    <th>PPID</th>
                     <th>Name</th>
+                    <th>Status</th>
                     <th>CPU %</th>
                     <th>Memory</th>
+                    <th>VSize</th>
                     <th>User</th>
                     <th>Runtime</th>
+                    <th>Cmdline</th>
                 </tr>
             </thead>
             <tbody id="processes-body" hx-get="/htmx/processes/chunk?offset=0&limit=100" hx-trigger="load" hx-swap="innerHTML"></tbody>
@@ -2056,15 +2078,25 @@ fn render_process_chunk_fragment(
 ) -> String {
     let mut html = String::new();
     for p in rows {
+        let ppid = p
+            .parent_pid
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let status = p.status.as_deref().unwrap_or("-");
+        let cmdline = p.cmdline.as_deref().unwrap_or("-");
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"cmdline\">{}</td></tr>",
             html_escape(timestamp),
             p.pid,
+            html_escape(&ppid),
             html_escape(&p.name),
+            html_escape(status),
             p.cpu_usage,
             html_escape(&format_bytes(p.mem_usage)),
+            html_escape(&format_bytes(p.virtual_memory)),
             html_escape(p.user.as_deref().unwrap_or("-")),
-            html_escape(&format_runtime(p.runtime))
+            html_escape(&format_runtime(p.runtime)),
+            html_escape(cmdline),
         ));
     }
 
@@ -2078,16 +2110,16 @@ fn render_process_chunk_fragment(
             next_offset
         );
         html.push_str(&format!(
-            r##"<tr id="load-more-processes"><td class="load-row" colspan="7"><button hx-get="{}" hx-target="#load-more-processes" hx-swap="outerHTML">Load more</button></td></tr>"##,
+            r##"<tr id="load-more-processes"><td class="load-row" colspan="11"><button hx-get="{}" hx-target="#load-more-processes" hx-swap="outerHTML">Load more</button></td></tr>"##,
             next_url
         ));
     } else if total_count == 0 {
         html.push_str(
-            r##"<tr id="load-more-processes"><td class="load-row muted" colspan="7">No processes found</td></tr>"##,
+            r##"<tr id="load-more-processes"><td class="load-row muted" colspan="11">No processes found</td></tr>"##,
         );
     } else {
         html.push_str(
-            r##"<tr id="load-more-processes"><td class="load-row muted" colspan="7">End of results</td></tr>"##,
+            r##"<tr id="load-more-processes"><td class="load-row muted" colspan="11">End of results</td></tr>"##,
         );
     }
 

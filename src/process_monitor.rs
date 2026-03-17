@@ -15,6 +15,10 @@ pub struct ProcessInfo {
     pub memory_bytes: u64,
     pub user_id: Option<String>,
     pub runtime_secs: u64,
+    pub cmd: Vec<String>,
+    pub virtual_memory_bytes: u64,
+    pub status: String,
+    pub parent_pid: Option<u32>,
 }
 
 /// Batch of process metrics with timestamp
@@ -117,6 +121,14 @@ impl ProcessMonitor {
                             memory_bytes: process.memory(),
                             user_id: process.user_id().map(|u| format!("{:?}", u)),
                             runtime_secs: process.run_time(),
+                            cmd: process
+                                .cmd()
+                                .iter()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .collect(),
+                            virtual_memory_bytes: process.virtual_memory(),
+                            status: process.status().to_string(),
+                            parent_pid: process.parent().map(|p| p.as_u32()),
                         })
                         .collect();
 

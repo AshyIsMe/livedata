@@ -24,6 +24,10 @@ pub struct ProcessMetricRecord {
     pub mem_usage: f64,
     pub user: Option<String>,
     pub runtime: u64,
+    pub cmdline: Option<String>,
+    pub virtual_memory: f64,
+    pub status: Option<String>,
+    pub parent_pid: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -35,7 +39,7 @@ pub struct StorageStats {
 }
 
 /// Schema version for tracking migrations
-const CURRENT_SCHEMA_VERSION: i32 = 1;
+const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 impl DuckDBBuffer {
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
@@ -129,12 +133,14 @@ impl DuckDBBuffer {
         timestamp: &str,
     ) -> Result<Vec<ProcessMetricRecord>> {
         trace_sql(
-            "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime
+            "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime,
+                    cmdline, virtual_memory, status, parent_pid
              FROM process_metrics
              WHERE timestamp = ?",
         );
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime
+            "SELECT timestamp, pid, name, cpu_usage, mem_usage, user, runtime,
+                    cmdline, virtual_memory, status, parent_pid
              FROM process_metrics
              WHERE timestamp = ?",
         )?;
@@ -148,6 +154,10 @@ impl DuckDBBuffer {
                 mem_usage: row.get(4)?,
                 user: row.get(5)?,
                 runtime: row.get::<_, i64>(6)? as u64,
+                cmdline: row.get(7)?,
+                virtual_memory: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                status: row.get(9)?,
+                parent_pid: row.get::<_, Option<i32>>(10)?.map(|v| v as u32),
             })
         })?;
 
@@ -384,6 +394,17 @@ impl DuckDBBuffer {
                 conn,
                 1,
                 "Create process_metrics table and ensure journal_logs schema",
+            )?;
+        }
+
+        // Migration 2: Add expanded process metrics columns
+        if current_version < 2 {
+            info!("Applying migration 2: Add expanded process metrics columns");
+            Self::migration_002(conn)?;
+            Self::record_migration(
+                conn,
+                2,
+                "Add cmdline, virtual_memory, status, parent_pid to process_metrics",
             )?;
         }
 
@@ -643,6 +664,24 @@ impl DuckDBBuffer {
         )?;
 
         info!("Migration 001: Created process_metrics table and ensured journal_logs schema");
+        Ok(())
+    }
+
+    /// Migration 002: Add expanded process metrics columns
+    fn migration_002(conn: &Connection) -> Result<()> {
+        let alter_stmts = [
+            "ALTER TABLE process_metrics ADD COLUMN IF NOT EXISTS cmdline TEXT",
+            "ALTER TABLE process_metrics ADD COLUMN IF NOT EXISTS virtual_memory DOUBLE",
+            "ALTER TABLE process_metrics ADD COLUMN IF NOT EXISTS status TEXT",
+            "ALTER TABLE process_metrics ADD COLUMN IF NOT EXISTS parent_pid INTEGER",
+        ];
+        for stmt in &alter_stmts {
+            trace_sql(stmt);
+            conn.execute(stmt, [])?;
+        }
+        info!(
+            "Migration 002: Added cmdline, virtual_memory, status, parent_pid to process_metrics"
+        );
         Ok(())
     }
 
@@ -985,6 +1024,13 @@ impl DuckDBBuffer {
                     .map(|s| s.to_string())
             });
 
+            let cmdline = if process.cmd.is_empty() {
+                None
+            } else {
+                Some(process.cmd.join(" "))
+            };
+            let parent_pid = process.parent_pid.map(|p| p as i32);
+
             appender.append_row(params![
                 timestamp.to_rfc3339(),
                 process.pid as i32,
@@ -993,6 +1039,10 @@ impl DuckDBBuffer {
                 process.memory_bytes as f64,
                 user,
                 process.runtime_secs as i64,
+                cmdline,
+                process.virtual_memory_bytes as f64,
+                process.status,
+                parent_pid,
             ])?;
         }
         appender.flush()?;
